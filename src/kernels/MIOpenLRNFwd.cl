@@ -23,13 +23,29 @@
  * SOFTWARE.
  *
  *******************************************************************************/
+#define PPCAT_NX(A, B) A##B
+#define PPCAT(A, B) PPCAT_NX(A, B)
+#define TWO 2
+#define THREE 3
+#define FOUR 4
+#define EIGHT 8
 
+#if MIOPEN_USE_FP16 == 1
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#define _FLOAT half
+#endif
+#if MIOPEN_USE_FP32 == 1
 #define _FLOAT float
-#define _FLOAT2 float2
-#define _FLOAT4 float4
-#define _FLOAT8 float8
+#endif
+
+#define _FLOAT2 PPCAT(_FLOAT, TWO)
+#define _FLOAT3 PPCAT(_FLOAT, THREE)
+#define _FLOAT4 PPCAT(_FLOAT, FOUR)
+#define _FLOAT8 PPCAT(_FLOAT, EIGHT)
 
 #define DBG_OUT 0
+
+#define UNUSED __attribute__((__unused__))
 
 #define MLO_LRN_GROUP_SZ2 1
 #define MLO_LRN_STRIDE 1
@@ -44,6 +60,14 @@
 #define MLO_LRN_LCL_DATA_HEIGHT (MLO_LRN_GROUP_SZ1 * MLO_LRN_N_VERT_OUT_PIX + MLO_LRN_KERNEL_SZ - 1)
 #define MLO_LRN_GROUP_SZ (MLO_LRN_GROUP_SZ2 * MLO_LRN_GROUP_SZ1 * MLO_LRN_GROUP_SZ0)
 //#define MLO_LRN_PREPAD_SZ (MLO_LRN_KERNEL_SZ - 1)/2
+
+struct LRNForwardParam
+{
+    _FLOAT alphaoverarea;
+    _FLOAT alpha;
+    _FLOAT beta;
+    _FLOAT K;
+};
 
 static inline int iDiv(int v, int d)
 {
@@ -64,12 +88,10 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
                           __global _FLOAT* scale,
 #endif
                           _FLOAT alphaoverarea,
-                          _FLOAT alpha,
+                          UNUSED _FLOAT alpha,
                           _FLOAT beta,
                           _FLOAT K)
 {
-
-    (void)alpha;
     // IT's taken from POOLING AVE with stride = 1'
     __local _FLOAT bot_data[MLO_LRN_LCL_DATA_WIDTH * MLO_LRN_LCL_DATA_HEIGHT];
     int x       = get_group_id(0) * MLO_LRN_GROUP_SZ0 * MLO_LRN_N_HORIZ_OUT_PIX;
@@ -81,8 +103,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
     int b       = iMod(ob, o, MLO_LRN_BATCH_SZ);
     int bot_x   = x;
     int bot_y   = y;
-    int bot_off =
-        mul24(b, (int)MLO_LRN_BOT_BATCH_STRIDE) + mul24(o, (int)MLO_LRN_BOT_CHANNEL_STRIDE);
+    int bot_off = b * MLO_LRN_BOT_BATCH_STRIDE + o * MLO_LRN_BOT_CHANNEL_STRIDE;
 
     // load tile
     for(int b_j = lcl_id1; b_j < MLO_LRN_LCL_DATA_HEIGHT; b_j += MLO_LRN_GROUP_SZ1)
@@ -91,7 +112,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
 
         bool invisibleY = (bot_y_act < 0) || (bot_y_act >= MLO_LRN_BOT_HEIGHT);
 
-        int bot_y_off = mul24(bot_y_act, (int)MLO_LRN_BOT_STRIDE);
+        int bot_y_off = bot_y_act * MLO_LRN_BOT_STRIDE;
 
         int lcl_off_v = mul24(b_j, (int)MLO_LRN_LCL_DATA_WIDTH);
 
@@ -111,9 +132,6 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
                 bot_off_x = (invisibleX || invisibleY) ? 0 : bot_off_x;
 
                 _FLOAT bot_val = bot[bot_off_x];
-                // since we need a sum of squares for the normalization
-                // we do the square at the input
-                bot_val *= bot_val;
 
                 bot_val = (invisibleX || invisibleY) ? 0 : bot_val;
 
@@ -170,8 +188,10 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         for(ii = 0; ii < (int)(MLO_LRN_N_HORIZ_OUT_PIX - 1); ++ii)
         {
 
-            _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT bot_val = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
+
+            _FLOAT accum_tmp = bot_val * bot_val;
+
 #if MLO_LRN_N_HORIZ_OUT_PIX > 1
             // save horizontal partial sums
             partial_sum_x[ii] = accum_tmp;
@@ -184,7 +204,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         {
 
             _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT accum_tmp = bot_val * bot_val;
             // accumulate in vert horizontal(0)
             partial_sum_xy[jj][0] += accum_tmp;
         }
@@ -195,7 +215,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         {
 
             _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT accum_tmp = bot_val * bot_val;
             // calculate all vertical-horizontal partial sums
             partial_sum_xy[jj][ii - MLO_LRN_KERNEL_SZ0 + 1] =
                 partial_sum_xy[jj][ii - MLO_LRN_KERNEL_SZ0] +
@@ -225,7 +245,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         {
 
             _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT accum_tmp = bot_val * bot_val;
 #if MLO_LRN_N_HORIZ_OUT_PIX > 1
             partial_sum_x[ii] = accum_tmp;
 #endif
@@ -236,7 +256,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         {
 
             _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT accum_tmp = bot_val * bot_val;
             mov_accum += accum_tmp;
         }
 
@@ -247,7 +267,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         {
 
             _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT accum_tmp = bot_val * bot_val;
             // running horizontal window
             mov_accum += (accum_tmp
 #if MLO_LRN_N_HORIZ_OUT_PIX > 1
@@ -268,7 +288,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         {
 
             _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT accum_tmp = bot_val * bot_val;
 #if MLO_LRN_N_HORIZ_OUT_PIX > 1
             partial_sum_x[ii] = accum_tmp;
 #endif
@@ -278,7 +298,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         {
 
             _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT accum_tmp = bot_val * bot_val;
             accum[jj - MLO_LRN_KERNEL_SZ1 + 1][0] += accum_tmp;
         }
         // running horizontal window
@@ -288,7 +308,7 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
         {
 
             _FLOAT bot_val   = bot_data[lcl_off + jj * MLO_LRN_LCL_DATA_WIDTH + ii];
-            _FLOAT accum_tmp = bot_val;
+            _FLOAT accum_tmp = bot_val * bot_val;
             //
             accum[jj - MLO_LRN_KERNEL_SZ1 + 1][ii - MLO_LRN_KERNEL_SZ0 + 1] =
                 accum[jj - MLO_LRN_KERNEL_SZ1 + 1][ii - MLO_LRN_KERNEL_SZ0] + accum_tmp;
@@ -370,15 +390,11 @@ MIOpenLRNWithinChannel_PS(const __global _FLOAT* bot,
             l++)
         {
             _FLOAT s;
-            _FLOAT bot_val;
-            s = native_exp((_FLOAT)-beta * native_log(prv_scale[k][l]));
+            s = exp((_FLOAT)-beta * log(prv_scale[k][l]));
             //					s = pow(prv_scale[k][l], -beta);
-            _FLOAT tmp = bot_data[lcl_off + mad24((k + MLO_LRN_PAD1),
-                                                  (int)MLO_LRN_LCL_DATA_WIDTH,
-                                                  (l + MLO_LRN_PAD0))];
-
-            // do a square root to get back to the raw input
-            bot_val = native_sqrt(tmp);
+            _FLOAT bot_val = bot_data[lcl_off + mad24((k + MLO_LRN_PAD1),
+                                                      (int)MLO_LRN_LCL_DATA_WIDTH,
+                                                      (l + MLO_LRN_PAD0))];
 #if MLO_LRN_DO_SCALE
             scale[scale_off + k * MLO_LRN_SCALE_STRIDE + l] = prv_scale[k][l];
 #endif
@@ -400,12 +416,10 @@ MIOpenLRNAcrossChannels4(const __global _FLOAT* bottom,
                          __global _FLOAT* scale,
 #endif
                          _FLOAT alphaoverarea,
-                         _FLOAT alpha,
+                         UNUSED _FLOAT alpha,
                          _FLOAT beta,
                          _FLOAT K)
 {
-
-    (void)alpha;
     int pix_id          = get_global_id(0); //
     int b               = get_global_id(2); // batch
     MLO_READ_TYPE accum = 0;
@@ -494,14 +508,14 @@ MIOpenLRNAcrossChannels4(const __global _FLOAT* bottom,
         scale_off = b * MLO_LRN_SCALE_BATCH_STRIDE + c_o * MLO_LRN_SCALE_CHANNEL_STRIDE +
                     (pix_id * MLO_READ_UNIT);
         MLO_READ_TYPE prv_scale = ((MLO_READ_TYPE)K + accum * (MLO_READ_TYPE)alphaoverarea);
-        //				fma(accum,alphaoverarea, 1.f);
+        //				fma(accum,alphaoverarea, (_FLOAT)1.f);
 
-        MLO_READ_TYPE exp_scale = native_exp((MLO_READ_TYPE)-beta * native_log(prv_scale));
+        MLO_READ_TYPE exp_scale = exp((MLO_READ_TYPE)-beta * log(prv_scale));
         //				pow(prv_scale,-beta);
         // bug
-        //	MLO_READ_TYPE prv_out = native_sqrt(bot_in2[c_o]);
+        //	MLO_READ_TYPE prv_out = sqrt(bot_in2[c_o]);
         MLO_READ_TYPE prv_out = bot_in2[c_o];
-        prv_out               = native_sqrt(prv_out);
+        prv_out               = sqrt(prv_out);
         MLO_READ_TYPE out_val = prv_out * exp_scale;
 #if MLO_LOW_CHNL_COUNT == 1
         if(c_o < MLO_LRN_N_OUTPUTS)
@@ -587,14 +601,14 @@ MIOpenLRNAcrossChannels4(const __global _FLOAT* bottom,
         scale_off = b * MLO_LRN_SCALE_BATCH_STRIDE + c_o * MLO_LRN_SCALE_CHANNEL_STRIDE +
                     (pix_id * MLO_READ_UNIT);
         MLO_READ_TYPE prv_scale = ((MLO_READ_TYPE)K + accum * (MLO_READ_TYPE)alphaoverarea);
-        //				fma(accum,alphaoverarea, 1.f);
+        //				fma(accum,alphaoverarea, (_FLOAT)1.f);
 
-        MLO_READ_TYPE exp_scale = native_exp((MLO_READ_TYPE)-beta * native_log(prv_scale));
+        MLO_READ_TYPE exp_scale = exp((MLO_READ_TYPE)-beta * log(prv_scale));
         //				pow(prv_scale,-beta);
         // bug
-        //			MLO_READ_TYPE prv_out = native_sqrt(bot_in2[MLO_LRN_PAD]);
+        //			MLO_READ_TYPE prv_out = sqrt(bot_in2[MLO_LRN_PAD]);
         MLO_READ_TYPE prv_out = bot_in2[MLO_LRN_PAD];
-        prv_out               = native_sqrt(prv_out);
+        prv_out               = sqrt(prv_out);
         MLO_READ_TYPE out_val = prv_out * exp_scale;
 
 #if MLO_LOW_CHNL_COUNT == 1
@@ -651,14 +665,14 @@ MIOpenLRNAcrossChannels4(const __global _FLOAT* bottom,
         scale_off = b * MLO_LRN_SCALE_BATCH_STRIDE + c_o * MLO_LRN_SCALE_CHANNEL_STRIDE +
                     (pix_id * MLO_READ_UNIT);
         MLO_READ_TYPE prv_scale = ((MLO_READ_TYPE)K + accum * (MLO_READ_TYPE)alphaoverarea);
-        //				fma(accum,alphaoverarea, 1.f);
+        //				fma(accum,alphaoverarea, (_FLOAT)1.f);
 
-        MLO_READ_TYPE exp_scale = native_exp((MLO_READ_TYPE)-beta * native_log(prv_scale));
+        MLO_READ_TYPE exp_scale = exp((MLO_READ_TYPE)-beta * log(prv_scale));
         //				pow(prv_scale,-beta);
         // bug
-        //			MLO_READ_TYPE prv_out = native_sqrt(bot_in2[MLO_LRN_PAD]);
+        //			MLO_READ_TYPE prv_out = sqrt(bot_in2[MLO_LRN_PAD]);
         MLO_READ_TYPE prv_out = bot_in2[MLO_LRN_PAD];
-        prv_out               = native_sqrt(prv_out);
+        prv_out               = sqrt(prv_out);
 
         MLO_READ_TYPE out_val = prv_out * exp_scale;
 #if MLO_LOW_CHNL_COUNT == 1

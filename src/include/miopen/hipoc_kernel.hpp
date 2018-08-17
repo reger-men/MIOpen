@@ -111,8 +111,8 @@ struct KernelArgs
 {
     KernelArgs(Ts... xs) : pack(xs...)
     {
-        for(int i     = 0; i < 6; i++)
-            hidden[i] = 0;
+        for(auto& x : hidden)
+            x = 0;
     }
     KernelArgsPack<Ts...> pack;
     uint64_t hidden[6] = {};
@@ -177,7 +177,9 @@ struct HIPOCKernel
         kernel_module = name;
         auto status   = hipModuleGetFunction(&fun, program.GetModule(), kernel_module.c_str());
         if(hipSuccess != status)
-            MIOPEN_THROW_HIP_STATUS(status, "Failed to get function: " + kernel_module);
+            MIOPEN_THROW_HIP_STATUS(status,
+                                    "Failed to get function: " + kernel_module + " from " +
+                                        program.GetBinary().string());
     }
 
     HIPOCKernelInvoke Invoke(hipStream_t stream,

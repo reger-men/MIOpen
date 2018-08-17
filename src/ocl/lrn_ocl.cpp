@@ -26,25 +26,21 @@
 #include <miopen/lrn.hpp>
 #include <miopen/mlo_internal.hpp>
 #include <miopen/float_equal.hpp>
+#include <miopen/visit_float.hpp>
 
 namespace miopen {
 
 miopenStatus_t LRNDescriptor::Forward(Handle& handle,
-                                      const void* alpha,
+                                      const void* /*alpha*/,
                                       const TensorDescriptor& xDesc,
                                       ConstData_t x,
-                                      const void* beta,
+                                      const void* /*beta*/,
                                       const TensorDescriptor& yDesc,
                                       Data_t y,
                                       bool do_backward,
-                                      Data_t workSpace)
+                                      Data_t workSpace) const
 {
 
-    if(!float_equal(*(static_cast<const float*>(alpha)), 1.0) ||
-       !float_equal(*(static_cast<const float*>(beta)), 0))
-    {
-        MIOPEN_THROW("Only alpha=1 and beta=0 is supported");
-    }
     miopenStatus_t status = miopenStatusSuccess;
     mlo_construct_norm construct_params(1); // forward
 
@@ -62,8 +58,8 @@ miopenStatus_t LRNDescriptor::Forward(Handle& handle,
     std::tie(nOut, cOut, hOut, wOut)                         = tien<4>(yDesc.GetLengths());
     std::tie(nOutStride, cOutStride, hOutStride, wOutStride) = tien<4>(yDesc.GetStrides());
 
-    construct_params.setTopDescr(
-        "NCHW", "FP32", nOut, cOut, hOut, wOut, nOutStride, cOutStride, hOutStride, wOutStride);
+    construct_params.setTopDescFromMLDesc(yDesc);
+
     int nIn;
     int cIn;
     int hIn;
@@ -76,8 +72,7 @@ miopenStatus_t LRNDescriptor::Forward(Handle& handle,
     std::tie(nIn, cIn, hIn, wIn)                         = tien<4>(xDesc.GetLengths());
     std::tie(nInStride, cInStride, hInStride, wInStride) = tien<4>(xDesc.GetStrides());
 
-    construct_params.setBotDescr(
-        "NCHW", "FP32", nIn, cIn, hIn, wIn, nInStride, cInStride, hInStride, wInStride);
+    construct_params.setBotDescFromMLDesc(xDesc);
 
     int norm_reg     = GetMode();
     int local_area   = GetN();
@@ -88,18 +83,7 @@ miopenStatus_t LRNDescriptor::Forward(Handle& handle,
     construct_params.doBackward(do_backward);
     construct_params.setNormDescr(norm_reg, local_area, lrn_alpha, lrn_beta, lrn_K);
 
-    status = static_cast<miopenStatus_t>(construct_params.mloConstruct());
-
-    std::string program_name          = construct_params.getKernelFile();      // CL kernel filename
-    std::string kernel_name           = construct_params.getKernelName();      // kernel name
-    const std::string& compiler_parms = construct_params.getCompilerOptions(); // kernel parameters
-
-    std::string network_config;
-    construct_params.mloBuildConf_Key(network_config);
-
-    const std::vector<size_t>& vld = construct_params.getLocalWkSize();
-    const std::vector<size_t>& vgd = construct_params.getGlobalWkSize();
-
+    mloConstruct(construct_params);
     int norm_region;
     int local_ar;
     // whithin channel alphaoverarea is going to be culculate based on actual areal size (cut by
@@ -116,40 +100,94 @@ miopenStatus_t LRNDescriptor::Forward(Handle& handle,
     auto f_norm_K             = static_cast<float>(norm_K);
     auto f_norm_alphaoverarea = static_cast<float>(norm_alphaoverarea);
 
-    KernelInvoke obj = handle.GetKernel(
-        "miopenLRNForward", network_config, program_name, kernel_name, vld, vgd, compiler_parms);
+    if(float_equal(f_norm_K, 0.0))
+        MIOPEN_THROW("Expect non-zero bias/K");
 
-    if(do_backward)
+    std::string algo_name = "miopenLRNForward";
+    std::string network_config =
+        std::to_string(f_norm_alpha) + std::to_string(f_norm_beta) + std::to_string(f_norm_K) +
+        std::to_string(f_norm_alphaoverarea) + std::to_string(local_ar) +
+        std::to_string(norm_region) + std::to_string(static_cast<int>(do_backward)) +
+        std::to_string(xDesc.GetType()) + std::to_string(nInStride) + std::to_string(nOutStride) +
+        std::to_string(nIn) + std::to_string(nOut) + std::to_string(nInStride) +
+        std::to_string(nOutStride) + std::to_string(cIn) + std::to_string(cOut) +
+        std::to_string(cInStride) + std::to_string(cOutStride) + std::to_string(hIn) +
+        std::to_string(hOut);
+
+    auto&& kernels = handle.GetKernels(algo_name, network_config);
+    if(!kernels.empty())
     {
-        obj(x, y, workSpace, f_norm_alphaoverarea, f_norm_alpha, f_norm_beta, f_norm_K);
+        visit_float(xDesc.GetType(), [&](auto as_float) {
+            if(do_backward)
+            {
+                kernels.front()(x,
+                                y,
+                                workSpace,
+                                as_float(f_norm_alphaoverarea),
+                                as_float(f_norm_alpha),
+                                as_float(f_norm_beta),
+                                as_float(f_norm_K));
+            }
+            else
+            {
+                kernels.front()(x,
+                                y,
+                                as_float(f_norm_alphaoverarea),
+                                as_float(f_norm_alpha),
+                                as_float(f_norm_beta),
+                                as_float(f_norm_K));
+            }
+        });
     }
     else
     {
-        obj(x, y, f_norm_alphaoverarea, f_norm_alpha, f_norm_beta, f_norm_K);
-    }
+        const std::string program_name = construct_params.getKernelFile(); // CL kernel filename
+        const std::string kernel_name  = construct_params.getKernelName(); // kernel name
+        const std::string& compiler_parms =
+            construct_params.getCompilerOptions(); // kernel parameters
+        const std::vector<size_t>& vld = construct_params.getLocalWkSize();
+        const std::vector<size_t>& vgd = construct_params.getGlobalWkSize();
 
+        KernelInvoke obj = handle.AddKernel(
+            algo_name, network_config, program_name, kernel_name, vld, vgd, compiler_parms);
+        visit_float(xDesc.GetType(), [&](auto as_float) {
+            if(do_backward)
+            {
+                obj(x,
+                    y,
+                    workSpace,
+                    as_float(f_norm_alphaoverarea),
+                    as_float(f_norm_alpha),
+                    as_float(f_norm_beta),
+                    as_float(f_norm_K));
+            }
+            else
+            {
+                obj(x,
+                    y,
+                    as_float(f_norm_alphaoverarea),
+                    as_float(f_norm_alpha),
+                    as_float(f_norm_beta),
+                    as_float(f_norm_K));
+            }
+        });
+    }
     return (status);
 }
 
 miopenStatus_t LRNDescriptor::Backward(Handle& handle,
-                                       const void* alpha,
+                                       const void* /*alpha*/,
                                        const TensorDescriptor& yDesc,
                                        ConstData_t y,
                                        const TensorDescriptor& dyDesc,
                                        ConstData_t dy,
                                        const TensorDescriptor& xDesc,
                                        ConstData_t x,
-                                       const void* beta,
+                                       const void* /*beta*/,
                                        const TensorDescriptor& dxDesc,
                                        Data_t dx,
-                                       ConstData_t workSpace)
+                                       ConstData_t workSpace) const
 {
-    if(!float_equal(*(static_cast<const float*>(alpha)), 1.0) ||
-       !float_equal(*(static_cast<const float*>(beta)), 0))
-    {
-        MIOPEN_THROW("Only alpha=1 and beta=0 is supported");
-    }
-
     miopenStatus_t status = miopenStatusSuccess;
     mlo_construct_norm construct_params(0); // backward
 
@@ -166,16 +204,7 @@ miopenStatus_t LRNDescriptor::Backward(Handle& handle,
     std::tie(ndOut, cdOut, hdOut, wdOut)                         = tien<4>(dyDesc.GetLengths());
     std::tie(ndOutStride, cdOutStride, hdOutStride, wdOutStride) = tien<4>(dyDesc.GetStrides());
 
-    construct_params.setTopDfDescr("NCHW",
-                                   "FP32",
-                                   ndOut,
-                                   cdOut,
-                                   hdOut,
-                                   wdOut,
-                                   ndOutStride,
-                                   cdOutStride,
-                                   hdOutStride,
-                                   wdOutStride);
+    construct_params.setTopDfDescFromMLDesc(dyDesc);
 
     int nOut;
     int cOut;
@@ -189,8 +218,7 @@ miopenStatus_t LRNDescriptor::Backward(Handle& handle,
     std::tie(nOut, cOut, hOut, wOut)                         = tien<4>(yDesc.GetLengths());
     std::tie(nOutStride, cOutStride, hOutStride, wOutStride) = tien<4>(yDesc.GetStrides());
 
-    construct_params.setTopDescr(
-        "NCHW", "FP32", nOut, cOut, hOut, wOut, nOutStride, cOutStride, hOutStride, wOutStride);
+    construct_params.setTopDescFromMLDesc(yDesc);
 
     int ndIn;
     int cdIn;
@@ -204,8 +232,7 @@ miopenStatus_t LRNDescriptor::Backward(Handle& handle,
     std::tie(ndIn, cdIn, hdIn, wdIn)                         = tien<4>(dxDesc.GetLengths());
     std::tie(ndInStride, cdInStride, hdInStride, wdInStride) = tien<4>(dxDesc.GetStrides());
 
-    construct_params.setBotDfDescr(
-        "NCHW", "FP32", ndIn, cdIn, hdIn, wdIn, ndInStride, cdInStride, hdInStride, wdInStride);
+    construct_params.setBotDfDescFromMLDesc(dxDesc);
 
     int nIn;
     int cIn;
@@ -219,8 +246,7 @@ miopenStatus_t LRNDescriptor::Backward(Handle& handle,
     std::tie(nIn, cIn, hIn, wIn)                         = tien<4>(xDesc.GetLengths());
     std::tie(nInStride, cInStride, hInStride, wInStride) = tien<4>(xDesc.GetStrides());
 
-    construct_params.setBotDescr(
-        "NCHW", "FP32", nIn, cIn, hIn, wIn, nInStride, cInStride, hInStride, wInStride);
+    construct_params.setBotDescFromMLDesc(xDesc);
 
     int norm_reg = GetMode();
 
@@ -232,17 +258,7 @@ miopenStatus_t LRNDescriptor::Backward(Handle& handle,
 
     construct_params.setNormDescr(norm_reg, local_area, lrn_alpha, lrn_beta, lrn_K);
 
-    status = static_cast<miopenStatus_t>(construct_params.mloConstruct());
-
-    std::string program_name   = construct_params.getKernelFile();      // CL kernel filename
-    std::string kernel_name    = construct_params.getKernelName();      // kernel name
-    std::string compiler_parms = construct_params.getCompilerOptions(); // kernel parameters
-
-    std::string network_config;
-    construct_params.mloBuildConf_Key(network_config);
-
-    const std::vector<size_t>& vld = construct_params.getLocalWkSize();
-    const std::vector<size_t>& vgd = construct_params.getGlobalWkSize();
+    mloConstruct(construct_params);
 
     int norm_region;
     int local_ar;
@@ -260,10 +276,57 @@ miopenStatus_t LRNDescriptor::Backward(Handle& handle,
     auto f_norm_ratio =
         static_cast<float>(2. * norm_alpha * norm_beta / static_cast<double>(local_ar));
 
-    handle.GetKernel(
-        "miopenLRNBackward", network_config, program_name, kernel_name, vld, vgd, compiler_parms)(
-        y, x, dy, workSpace, dx, f_norm_ratio, f_norm_alpha, f_norm_beta);
+    if(float_equal(norm_K, 0.0))
+        MIOPEN_THROW("Expect non-zero bias/K");
 
+    std::string algo_name = "miopenLRNBackward";
+    std::string network_config =
+        std::to_string(f_norm_alpha) + std::to_string(f_norm_beta) + std::to_string(norm_K) +
+        std::to_string(norm_alphaoverarea) + std::to_string(local_ar) +
+        std::to_string(norm_region) + std::to_string(f_norm_ratio) +
+        std::to_string(xDesc.GetType()) + std::to_string(nInStride) + std::to_string(nOutStride) +
+        std::to_string(nIn) + std::to_string(nOut) + std::to_string(nInStride) +
+        std::to_string(nOutStride) + std::to_string(cIn) + std::to_string(cOut) +
+        std::to_string(cInStride) + std::to_string(cOutStride) + std::to_string(hIn) +
+        std::to_string(hOut);
+
+    auto&& kernels = handle.GetKernels(algo_name, network_config);
+    if(!kernels.empty())
+    {
+        visit_float(xDesc.GetType(), [&](auto as_float) {
+            kernels.front()(y,
+                            x,
+                            dy,
+                            workSpace,
+                            dx,
+                            as_float(f_norm_ratio),
+                            as_float(f_norm_alpha),
+                            as_float(f_norm_beta));
+        });
+    }
+    else
+    {
+        const std::string program_name = construct_params.getKernelFile(); // CL kernel filename
+        const std::string kernel_name  = construct_params.getKernelName(); // kernel name
+        const std::string& compiler_parms =
+            construct_params.getCompilerOptions(); // kernel parameters
+
+        const std::vector<size_t>& vld = construct_params.getLocalWkSize();
+        const std::vector<size_t>& vgd = construct_params.getGlobalWkSize();
+
+        visit_float(xDesc.GetType(), [&](auto as_float) {
+            handle.AddKernel(
+                algo_name, network_config, program_name, kernel_name, vld, vgd, compiler_parms)(
+                y,
+                x,
+                dy,
+                workSpace,
+                dx,
+                as_float(f_norm_ratio),
+                as_float(f_norm_alpha),
+                as_float(f_norm_beta));
+        });
+    }
     return (status);
 }
 } // namespace miopen

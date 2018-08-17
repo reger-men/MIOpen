@@ -65,6 +65,7 @@ int mlo_construct_pooling2D::mloConstruct()
     {
         ret = mloConstructBwd();
     }
+
     return (ret);
 }
 
@@ -75,8 +76,18 @@ int mlo_construct_pooling2D::mloConstructFwd()
     _grp_tile0 = 8;
     _grp_tile1 = 8;
 
-    _out_pix_tile0 = (_search_params.out_width < _grp_tile0 * 2) ? 1 : 2;
-    _out_pix_tile1 = (_search_params.out_height < _grp_tile1 * 2) ? 1 : 2;
+    _out_pix_tile0 = std::max(1, 8 / _search_params.kernel_stride0);
+    _out_pix_tile1 = std::max(1, 8 / _search_params.kernel_stride1);
+
+    while(_out_pix_tile0 * _grp_tile0 > _search_params.out_width * 2 && _out_pix_tile0 > 1)
+    {
+        _out_pix_tile0 >>= 1;
+    }
+
+    while(_out_pix_tile1 * _grp_tile1 > _search_params.out_height * 2 && _out_pix_tile1 > 1)
+    {
+        _out_pix_tile1 >>= 1;
+    }
 
     _comp_options = std::string(" -DMLO_POOLING_OP_ID=") +
                     std::to_string(static_cast<long long>(_pooling_method)) +
@@ -144,7 +155,7 @@ int mlo_construct_pooling2D::mloConstructFwd()
 
     _kernel_file = "MIOpenPooling.cl";
 
-    _kernel_name = "mloPooling";
+    _kernel_name = "mloPoolingG";
 
     return (ret);
 }
@@ -232,7 +243,7 @@ int mlo_construct_pooling2D::mloConstructBwd()
     }
     else
     {
-        std::cout << "Layer: %s. Error: unknowm method\n";
+        MIOPEN_LOG_E("Layer: %s. Error: unknowm method"); /// FIXME %s?
         ret = -1;
     }
     return (ret);

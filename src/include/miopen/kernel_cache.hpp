@@ -45,20 +45,13 @@
 
 #include <miopen/handle.hpp>
 #include <miopen/kernel.hpp>
+#include <miopen/simple_hash.hpp>
 #include <miopen/miopen.h>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace miopen {
-
-struct SimpleHash
-{
-    size_t operator()(const std::pair<std::string, std::string>& p) const
-    {
-        using std::hash;
-        return (hash<std::string>()(p.first) ^ hash<std::string>()(p.second));
-    }
-};
 
 /**
  * @brief The KernelCache class Build and cache kernels
@@ -69,19 +62,25 @@ class KernelCache
 
     public:
     using Key        = std::pair<std::string, std::string>;
-    using KernelMap  = std::unordered_map<Key, Kernel, SimpleHash>;
+    using KernelMap  = std::unordered_map<Key, std::vector<Kernel>, SimpleHash>;
     using ProgramMap = std::unordered_map<Key, Program, SimpleHash>;
 
-    Kernel GetKernel(Handle& h,
+    Kernel AddKernel(Handle& h,
                      const std::string& algorithm,
                      const std::string& network_config,
                      const std::string& program_name,
                      const std::string& kernel_name,
                      const std::vector<size_t>& vld,
                      const std::vector<size_t>& vgd,
-                     std::string params = "");
+                     std::string params      = "",
+                     std::size_t cache_index = 0);
 
-    Kernel GetKernel(const std::string& algorithm, const std::string& network_config);
+    void AddKernel(Key key, Kernel k, std::size_t cache_index);
+
+    void ClearKernels(const std::string& algorithm, const std::string& network_config);
+
+    const std::vector<Kernel>& GetKernels(const std::string& algorithm,
+                                          const std::string& network_config);
 
     KernelCache();
 

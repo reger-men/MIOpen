@@ -25,51 +25,54 @@
  *******************************************************************************/
 
 #include <unordered_map>
+#include <sstream>
 #include "miopen/solver.hpp"
+#include "miopen/gcn_asm_utils.hpp"
 
 namespace miopen {
 namespace solver {
 
 bool ConvAsm7x7c3h224w224k64u2v2p3q3f1::IsApplicable(const ConvolutionContext& params) const
 {
-    if(!params.assembler_available)
+    if(!params.use_asm_kernels)
+    {
+        return false;
+    }
+    if(!((params.rmv == rocm_meta_version::V3) || (params.rmv == rocm_meta_version::AMDHSA_1_0)))
     {
         return false;
     }
 
     const std::string name = params.GetStream().GetDeviceName();
     if(!(name == "gfx800" || name == "gfx802" || name == "gfx803" || name == "gfx804" ||
-         name == "gfx900"))
+         name == "gfx900" || name == "gfx904" || name == "gfx906"))
     {
         return false;
     }
-    if(!params.forward)
+    if(!params.direction.IsForward())
     {
         return false;
     }
-    if(params.rmv != V3)
-    {
-        return false;
-    }
-    assert(params.weights_layout.length() == 0); // FIXME _weights_layout is not supported yet.
+    assert(params.weights_layout.length() == 0); // weights_layout is not supported yet.
 
-    // Opt. Param   Restrictions in source
-    return params.pad0 == 3               // -q
-           && params.pad1 == 3            // -p
-           && params.kernel_stride0 == 2  // -u
-           && params.kernel_stride1 == 2  // -v
-           && params.kernel_size0 == 7    // -x
-           && params.kernel_size1 == 7    // -y
-           && params.n_inputs == 3        // -c
-           && params.n_outputs == 64      // -k
-           && params.in_width == 224      // -W
-           && params.in_height == 224     // -H
-           && params.in_layout == "NCHW"; //              hardcoded
-    // && (isForwardDirection() ? _weights_layout == "KCHW" : _weights_layout == "CKHW" )
+    // clang-format off
+    return params.pad0 == 3            // -q
+        && params.pad1 == 3            // -p
+        && params.kernel_stride0 == 2  // -u
+        && params.kernel_stride1 == 2  // -v
+        && params.kernel_size0 == 7    // -x
+        && params.kernel_size1 == 7    // -y
+        && params.n_inputs == 3        // -c
+        && params.n_outputs == 64      // -k
+        && params.in_width == 224      // -W
+        && params.in_height == 224     // -H
+        && params.float_size == 32
+        && params.in_layout == "NCHW";
+        // && (isForwardDirection() ? _weights_layout == "KCHW" : _weights_layout == "CKHW" )
+    // clang-format on
 }
 
-ConvSolution ConvAsm7x7c3h224w224k64u2v2p3q3f1::GetSolution(const ConvolutionContext& params,
-                                                            const PerformanceConfig&) const
+ConvSolution ConvAsm7x7c3h224w224k64u2v2p3q3f1::GetSolution(const ConvolutionContext& params) const
 {
     ConvSolution result;
     const int out_w =
@@ -79,8 +82,11 @@ ConvSolution ConvAsm7x7c3h224w224k64u2v2p3q3f1::GetSolution(const ConvolutionCon
         (params.in_height + params.pad1 * 2 + params.kernel_stride1 - params.kernel_size1) /
         params.kernel_stride1; // (inp_h + 2*pad_h + inp_v - wei_h) / inp_v
 
+    std::ostringstream options;
+    GenerateClangDefsym(
+        options, "ROCM_METADATA_VERSION", (params.rmv == rocm_meta_version::V3) ? 3 : 4);
     KernelInfo constr_params;
-    constr_params.comp_options = "";
+    constr_params.comp_options = options.str();
 
     constr_params.l_wk.push_back(64);
     constr_params.l_wk.push_back(8);

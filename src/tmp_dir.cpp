@@ -1,12 +1,15 @@
 #include <miopen/tmp_dir.hpp>
 #include <boost/filesystem.hpp>
 #include <miopen/errors.hpp>
+#include <miopen/logger.hpp>
 
 namespace miopen {
 
 void SystemCmd(std::string cmd)
 {
-// std::cout << cmd << std::endl;
+#ifndef NDEBUG
+    MIOPEN_LOG_I(cmd);
+#endif
 // We shouldn't call system commands
 #ifdef MIOPEN_USE_CLANG_TIDY
     (void)cmd;

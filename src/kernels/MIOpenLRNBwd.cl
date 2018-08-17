@@ -23,11 +23,28 @@
  * SOFTWARE.
  *
  *******************************************************************************/
+#define PPCAT_NX(A, B) A##B
+#define PPCAT(A, B) PPCAT_NX(A, B)
+#define TWO 2
+#define THREE 3
+#define FOUR 4
+#define EIGHT 8
 
+#define DBG_RANGE 0
+#if MIOPEN_USE_FP16 == 1
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#define _FLOAT half
+#endif
+#if MIOPEN_USE_FP32 == 1
 #define _FLOAT float
-#define _FLOAT2 float2
-#define _FLOAT4 float4
-#define _FLOAT8 float8
+#endif
+
+#define _FLOAT2 PPCAT(_FLOAT, TWO)
+#define _FLOAT3 PPCAT(_FLOAT, THREE)
+#define _FLOAT4 PPCAT(_FLOAT, FOUR)
+#define _FLOAT8 PPCAT(_FLOAT, EIGHT)
+
+#define UNUSED __attribute__((__unused__))
 
 #define MLO_LRN_GROUP_SZ2 1
 #define MLO_LRN_STRIDE 1
@@ -36,6 +53,21 @@
 #define MLO_LRN_LCL_DATA_HEIGHT (MLO_LRN_GROUP_SZ1 * MLO_LRN_N_VERT_OUT_PIX + MLO_LRN_KERNEL_SZ - 1)
 #define MLO_LRN_GROUP_SZ (MLO_LRN_GROUP_SZ2 * MLO_LRN_GROUP_SZ1 * MLO_LRN_GROUP_SZ0)
 //#define MLO_LRN_PREPAD_SZ (MLO_LRN_KERNEL_SZ - 1)/2
+
+struct LRNForwardParam
+{
+    _FLOAT alphaoverarea;
+    _FLOAT alpha;
+    _FLOAT beta;
+    _FLOAT K;
+};
+
+struct LRNBackwardParam
+{
+    _FLOAT ratio;
+    _FLOAT alpha;
+    _FLOAT beta;
+};
 
 /*
 
@@ -51,11 +83,10 @@ MIOpenLRNWithinChannelBwd(const __global _FLOAT* top,
                           const __global _FLOAT* top_df,
                           const __global _FLOAT* scale,
                           __global _FLOAT* bot_df,
-                          _FLOAT ratio, // 2. * alpha * beta / local_area
+                          UNUSED _FLOAT ratio,
                           _FLOAT alpha,
                           _FLOAT beta)
 {
-    (void)ratio;
     __local _FLOAT top_df_data[MLO_LRN_LCL_DATA_WIDTH * MLO_LRN_LCL_DATA_HEIGHT];
     __local _FLOAT ratio_data[MLO_LRN_LCL_DATA_WIDTH * MLO_LRN_LCL_DATA_HEIGHT];
     int x          = get_group_id(0) * MLO_LRN_GROUP_SZ0 * MLO_LRN_N_HORIZ_OUT_PIX;
@@ -97,12 +128,18 @@ MIOpenLRNWithinChannelBwd(const __global _FLOAT* top,
             bool invisibleX = (top_x_act < 0) || (top_x_act >= MLO_LRN_TOP_WIDTH);
 
             top_x_act = (invisibleX) ? 0 : top_x_act;
-
+#if DBG_RANGE
+            if(top_df_off + top_df_y_off + top_x_act >=
+               MLO_LRN_BATCH_SZ * MLO_LRN_TOPDF_BATCH_STRIDE)
+            {
+                printf("K:err:topdf-off_range\n");
+            }
+#endif
             _FLOAT top_df_val = top_df[top_df_off + top_df_y_off + top_x_act];
             _FLOAT scale_val  = scale[scale_off + scale_y_off + top_x_act];
 
             top_df_val = (invisibleX || invisibleY) ? 0 : top_df_val;
-            scale_val  = (invisibleX || invisibleY) ? 1.f : scale_val;
+            scale_val  = (invisibleX || invisibleY) ? (_FLOAT)1.f : scale_val;
 
             top_df_data[lcl_off_v + b_i] = top_df_val;
             ratio_data[lcl_off_v + b_i]  = scale_val;
@@ -120,10 +157,7 @@ MIOpenLRNWithinChannelBwd(const __global _FLOAT* top,
         {
             _FLOAT scale_ratio =
                 ratio_data[lcl_off_v + lcl_id0 * MLO_LRN_N_HORIZ_OUT_PIX + MLO_LRN_PAD + i];
-            prv_exp_scale[j][i] = native_exp(-beta * native_log(scale_ratio));
-            //				prv_exp_scale[j][i]= pow(scale, -beta);
-
-            //				prv_top_df[j][i] = top_df_val;
+            prv_exp_scale[j][i] = exp(-beta * log(scale_ratio));
         }
     }
 
@@ -149,6 +183,13 @@ MIOpenLRNWithinChannelBwd(const __global _FLOAT* top,
             bool invisibleX = (top_x_act < 0) || (top_x_act >= MLO_LRN_TOP_WIDTH);
 
             top_x_act = (invisibleX) ? 0 : top_x_act;
+#if DBG_RANGE
+
+            if(top_off + top_y_off + top_x_act >= MLO_LRN_BATCH_SZ * MLO_LRN_TOP_BATCH_STRIDE)
+            {
+                printf("K:err:top-off_range\n");
+            }
+#endif
 
             _FLOAT top_val = top[top_off + top_y_off + top_x_act];
 
@@ -182,7 +223,7 @@ MIOpenLRNWithinChannelBwd(const __global _FLOAT* top,
         int lcl_v_off_v = (v_off_v + MLO_LRN_PAD) * MLO_LRN_LCL_DATA_WIDTH;
         for(int i = 0; i < MLO_LRN_N_HORIZ_OUT_PIX; i++)
         {
-            _FLOAT prv_ratio_accum = 0;
+            _FLOAT prv_ratio_accum = (_FLOAT)0;
             int v_off_h            = lcl_id0 * MLO_LRN_N_HORIZ_OUT_PIX + i;
 
             int wstart = x + v_off_h - MLO_LRN_PAD;
@@ -205,9 +246,25 @@ MIOpenLRNWithinChannelBwd(const __global _FLOAT* top,
             }
 
             _FLOAT top_df_val = top_df_data[lcl_v_off_v + lcl_v_off_h];
-            _FLOAT bot_dta    = bot[MLO_LRN_BOT_BATCH_STRIDE * b + MLO_LRN_BOT_CHANNEL_STRIDE * o +
-                                 MLO_LRN_BOT_STRIDE * (y + v_off_v) + x + v_off_h];
-            _FLOAT adj_ratio       = 2.f * alpha * beta / adj_area_size;
+
+            uint bot_off0 = MLO_LRN_BOT_BATCH_STRIDE * b + MLO_LRN_BOT_CHANNEL_STRIDE * o +
+                            MLO_LRN_BOT_STRIDE * (y + v_off_v) + x + v_off_h;
+
+            uint bot_off = (bot_off0 < MLO_LRN_BATCH_SZ * MLO_LRN_BOT_BATCH_STRIDE)
+                               ? bot_off0
+                               : MLO_LRN_BATCH_SZ * MLO_LRN_BOT_BATCH_STRIDE - 1;
+#if DBG_RANGE
+
+            if(bot_off >= MLO_LRN_BATCH_SZ * MLO_LRN_BOT_BATCH_STRIDE)
+            {
+                printf("K:err:bot-off_range\n");
+            }
+#endif
+            _FLOAT bot_dta = bot[bot_off];
+
+            bot_dta = (bot_off0 < MLO_LRN_BATCH_SZ * MLO_LRN_BOT_BATCH_STRIDE) ? bot_dta : 0;
+
+            _FLOAT adj_ratio       = (_FLOAT)2.f * alpha * beta / adj_area_size;
             _FLOAT prv_accum_ratio = adj_ratio * bot_dta * prv_ratio_accum;
             prv_bot_diff[j][i]     = prv_exp_scale[j][i] * top_df_val - prv_accum_ratio;
         }
@@ -219,7 +276,15 @@ MIOpenLRNWithinChannelBwd(const __global _FLOAT* top,
         {
             if(bot_y + j < MLO_LRN_BOT_HEIGHT && bot_x + i < MLO_LRN_BOT_WIDTH)
             {
+#if DBG_RANGE
 
+                if(MLO_LRN_BOTDF_BATCH_STRIDE * b + MLO_LRN_BOTDF_CHANNEL_STRIDE * o +
+                       MLO_LRN_BOTDF_STRIDE * (bot_y + j) + bot_x + i >=
+                   MLO_LRN_BATCH_SZ * MLO_LRN_BOTDF_BATCH_STRIDE)
+                {
+                    printf("K:err:botdf-off_range\n");
+                }
+#endif
                 bot_df[MLO_LRN_BOTDF_BATCH_STRIDE * b + MLO_LRN_BOTDF_CHANNEL_STRIDE * o +
                        MLO_LRN_BOTDF_STRIDE * (bot_y + j) + bot_x + i] = prv_bot_diff[j][i];
             }
@@ -240,12 +305,10 @@ MIOpenLRNAcrossChannelsBwd1(const __global _FLOAT* top,
                             const __global _FLOAT* top_df,
                             const __global _FLOAT* scale,
                             __global _FLOAT* bot_df,
-                            _FLOAT ratio, // 2. * alpha * beta / local_area
-                            _FLOAT alpha,
+                            _FLOAT ratio,
+                            UNUSED _FLOAT alpha,
                             _FLOAT beta)
 {
-
-    (void)alpha;
     int x              = get_global_id(0); // channel x
     int y              = get_global_id(1); // channel y
     int b              = get_global_id(2); // batch
@@ -298,7 +361,7 @@ MIOpenLRNAcrossChannelsBwd1(const __global _FLOAT* top,
 
             _FLOAT prv_scale = scale_in[c_o];
 
-            _FLOAT exp_scale = native_exp(-beta * native_log(prv_scale));
+            _FLOAT exp_scale = exp(-beta * log(prv_scale));
             //					pow(prv_scale, -beta);
 
             _FLOAT prv_accum_ratio = ratio * bot_dta * accum_ratio;
@@ -352,7 +415,7 @@ MIOpenLRNAcrossChannelsBwd1(const __global _FLOAT* top,
 
             _FLOAT prv_scale = scale_in[MLO_LRN_PAD];
 
-            _FLOAT exp_scale = native_exp(-beta * native_log(prv_scale));
+            _FLOAT exp_scale = exp(-beta * log(prv_scale));
             //				pow(prv_scale,-beta);
 
             _FLOAT prv_accum_ratio = ratio * bot_dta * accum_ratio;
@@ -387,7 +450,7 @@ MIOpenLRNAcrossChannelsBwd1(const __global _FLOAT* top,
 
             _FLOAT prv_scale = scale_in[MLO_LRN_PAD];
 
-            _FLOAT exp_scale = native_exp(-beta * native_log(prv_scale));
+            _FLOAT exp_scale = exp(-beta * log(prv_scale));
             //				pow(prv_scale,-beta);
 
             _FLOAT prv_accum_ratio = ratio * bot_dta * accum_ratio;

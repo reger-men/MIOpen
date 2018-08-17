@@ -23,16 +23,19 @@
  * SOFTWARE.
  *
  *******************************************************************************/
+#include <miopen/config.h>
 #include <miopen/device_name.hpp>
 #include <miopen/errors.hpp>
 #include <miopen/handle.hpp>
 #include <miopen/kernel_cache.hpp>
 #include <miopen/manage_ptr.hpp>
 #include <miopen/ocldeviceinfo.hpp>
-#if MIOPEN_USE_CACHE
 #include <miopen/binary_cache.hpp>
 #include <miopen/load_file.hpp>
 #include <boost/filesystem.hpp>
+#include <miopen/handle_lock.hpp>
+#if MIOPEN_USE_MIOPENGEMM
+#include <miopen/gemm_geometry.hpp>
 #endif
 #include <string>
 
@@ -291,7 +294,7 @@ struct HandleImpl
                 }
 
                 platform = platforms[i];
-                if(!strcmp(pbuf, "Advanced Micro Devices, Inc."))
+                if(strcmp(pbuf, "Advanced Micro Devices, Inc.") == 0)
                 {
                     break;
                 }
@@ -334,10 +337,13 @@ struct HandleImpl
 
     void SetProfilingResult(cl_event& e)
     {
-        size_t st, end;
-        clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_START, sizeof(size_t), &st, nullptr);
-        clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END, sizeof(size_t), &end, nullptr);
-        profiling_result = ((end - st) * 1e-6);
+        if(this->enable_profiling)
+        {
+            size_t st, end;
+            clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_START, sizeof(size_t), &st, nullptr);
+            clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END, sizeof(size_t), &end, nullptr);
+            profiling_result = ((end - st) * 1e-6);
+        }
     }
 };
 
@@ -463,54 +469,51 @@ void Handle::AccumKernelTime(float curr_time) { this->impl->AccumProfilingResult
 
 float Handle::GetKernelTime() const { return this->impl->profiling_result; }
 
-KernelInvoke Handle::GetKernel(const std::string& algorithm,
+KernelInvoke Handle::AddKernel(const std::string& algorithm,
                                const std::string& network_config,
                                const std::string& program_name,
                                const std::string& kernel_name,
                                const std::vector<size_t>& vld,
                                const std::vector<size_t>& vgd,
-                               const std::string& params)
+                               const std::string& params,
+                               std::size_t cache_index)
 {
-    auto q   = this->GetStream();
-    auto obj = this->impl->cache.GetKernel(
-        *this, algorithm, network_config, program_name, kernel_name, vld, vgd, params);
 
-#ifndef NDEBUG
-// dumpKernel(obj.GetKernel(), kernel_name, vld, vgd, params);
-#endif
-    if(this->impl->enable_profiling)
-    {
-        return obj.Invoke(q,
-                          std::bind(&HandleImpl::SetProfilingResult,
-                                    std::ref(*this->impl),
-                                    std::placeholders::_1));
-    }
-    else
-    {
-        return obj.Invoke(q);
-    }
+    auto obj = this->impl->cache.AddKernel(
+        *this, algorithm, network_config, program_name, kernel_name, vld, vgd, params, cache_index);
+    return this->Run(obj);
 }
 
-KernelInvoke Handle::GetKernel(const std::string& algorithm, const std::string& network_config)
+void Handle::ClearKernels(const std::string& algorithm, const std::string& network_config)
 {
-    auto q         = this->GetStream();
-    const auto obj = this->impl->cache.GetKernel(algorithm, network_config);
-    if(this->impl->enable_profiling)
+
+    this->impl->cache.ClearKernels(algorithm, network_config);
+}
+
+const std::vector<Kernel>& Handle::GetKernelsImpl(const std::string& algorithm,
+                                                  const std::string& network_config)
+{
+    return this->impl->cache.GetKernels(algorithm, network_config);
+}
+
+KernelInvoke Handle::Run(Kernel k)
+{
+    auto q = this->GetStream();
+    if(this->impl->enable_profiling || MIOPEN_GPU_SYNC)
     {
-        return obj.Invoke(q,
-                          std::bind(&HandleImpl::SetProfilingResult,
-                                    std::ref(*this->impl),
-                                    std::placeholders::_1));
+        return k.Invoke(q,
+                        std::bind(&HandleImpl::SetProfilingResult,
+                                  std::ref(*this->impl),
+                                  std::placeholders::_1));
     }
     else
     {
-        return obj.Invoke(q);
+        return k.Invoke(q);
     }
 }
 
 Program Handle::LoadProgram(const std::string& program_name, std::string params, bool is_kernel_str)
 {
-#if MIOPEN_USE_CACHE
     auto cache_file =
         miopen::LoadBinary(this->GetDeviceName(), program_name, params, is_kernel_str);
     if(cache_file.empty())
@@ -535,13 +538,6 @@ Program Handle::LoadProgram(const std::string& program_name, std::string params,
                                  miopen::GetDevice(this->GetStream()),
                                  miopen::LoadFile(cache_file));
     }
-#else
-    return miopen::LoadProgram(miopen::GetContext(this->GetStream()),
-                               miopen::GetDevice(this->GetStream()),
-                               program_name,
-                               params,
-                               is_kernel_str);
-#endif
 }
 
 void Handle::Finish() const { clFinish(this->GetStream()); }
@@ -566,10 +562,18 @@ std::size_t Handle::GetMaxComputeUnits()
     return miopen::GetDeviceInfo<CL_DEVICE_MAX_COMPUTE_UNITS>(miopen::GetDevice(this->GetStream()));
 }
 
-Allocator::ManageDataPtr Handle::Create(std::size_t sz) { return this->impl->allocator(sz); }
+Allocator::ManageDataPtr Handle::Create(std::size_t sz)
+{
+    MIOPEN_HANDLE_LOCK
+    this->Finish();
+    return this->impl->allocator(sz);
+}
+
 Allocator::ManageDataPtr&
 Handle::WriteTo(const void* data, Allocator::ManageDataPtr& ddata, std::size_t sz)
 {
+    MIOPEN_HANDLE_LOCK
+    this->Finish();
     cl_int status = clEnqueueWriteBuffer(
         this->GetStream(), ddata.get(), CL_TRUE, 0, sz, data, 0, nullptr, nullptr);
     if(status != CL_SUCCESS)
@@ -581,6 +585,8 @@ Handle::WriteTo(const void* data, Allocator::ManageDataPtr& ddata, std::size_t s
 
 void Handle::ReadTo(void* data, const Allocator::ManageDataPtr& ddata, std::size_t sz)
 {
+    MIOPEN_HANDLE_LOCK
+    this->Finish();
     auto status = clEnqueueReadBuffer(
         this->GetStream(), ddata.get(), CL_TRUE, 0, sz, data, 0, nullptr, nullptr);
     if(status != CL_SUCCESS)
@@ -591,12 +597,28 @@ void Handle::ReadTo(void* data, const Allocator::ManageDataPtr& ddata, std::size
 
 void Handle::Copy(ConstData_t src, Data_t dest, std::size_t size)
 {
+    MIOPEN_HANDLE_LOCK
+    this->Finish();
     auto status =
         clEnqueueCopyBuffer(this->GetStream(), src, dest, 0, 0, size, 0, nullptr, nullptr);
     if(status != CL_SUCCESS)
     {
         MIOPEN_THROW_CL_STATUS(status, "OpenCL error copying buffer: " + std::to_string(size));
     }
+}
+
+shared<Data_t> Handle::CreateSubBuffer(Data_t data, std::size_t offset, std::size_t size)
+{
+    MIOPEN_HANDLE_LOCK
+    struct region
+    {
+        std::size_t origin;
+        std::size_t size;
+    };
+    cl_int error = 0;
+    auto r       = region{offset, size};
+    auto mem = clCreateSubBuffer(data, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &r, &error);
+    return {mem, manage_deleter<decltype(&clReleaseMemObject), &clReleaseMemObject>{}};
 }
 
 } // namespace miopen

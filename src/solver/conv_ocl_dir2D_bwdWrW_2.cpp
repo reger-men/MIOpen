@@ -32,6 +32,14 @@ namespace solver {
 
 bool ConvOclBwdWrW2::IsApplicable(const ConvolutionContext& params) const
 {
+    // FIE ME:  it sounds a bug to enable kernel_size1x1 from original condition
+    if(params.kernel_size0 == 1 && params.kernel_size1 == 1)
+        return false;
+
+    /// \todo Workaround for issue 918. Looks like dy tensor with padding < 1 is not supported.
+    if((params.GetBackwardPad0() < 1 || params.GetBackwardPad1() < 1))
+        return false;
+
     return ((params.kernel_size0 >= params.kernel_size1) &&
             ((params.kernel_stride0 > 1 || params.kernel_stride1 > 1) ||
              (params.kernel_size0 > 5) || (params.kernel_size0 == 5 && params.in_width >= 64))) ||
@@ -39,8 +47,7 @@ bool ConvOclBwdWrW2::IsApplicable(const ConvolutionContext& params) const
             (params.kernel_size0 != 1 || params.kernel_size1 != 1));
 }
 
-ConvSolution ConvOclBwdWrW2::GetSolution(const ConvolutionContext& params,
-                                         const PerformanceConfig&) const
+ConvSolution ConvOclBwdWrW2::GetSolution(const ConvolutionContext& params) const
 {
     static const char* s_stride_table[32][2] = {
         //
@@ -92,7 +99,7 @@ ConvSolution ConvOclBwdWrW2::GetSolution(const ConvolutionContext& params,
     result.n_out_pix_tiles = 2;
     int read_unit          = 6;
 
-    int N_ALIGNED_OUT_SCAN_BLK = (params.out_width > 512) ? 1 : 2;
+    int N_ALIGNED_OUT_SCAN_BLK = 2;
 
     if(found)
     {
@@ -112,17 +119,24 @@ ConvSolution ConvOclBwdWrW2::GetSolution(const ConvolutionContext& params,
 
     const auto _hw_wave_sz = 64;
     //_dev_local_mem_sz = localMemSize; // in bytes
+    // inpout are outputs
+    int wei_cstride = params.kernel_size0 * params.kernel_size1;
+    int wei_bstride = params.n_outputs * wei_cstride;
 
     // number  of batch iterations
     result.n_stacks = 1;
     result.n_stacks = std::min(params.batch_sz, result.n_stacks);
+    assert((N_BATCH_LOOPS * result.n_stacks) != 0);
     int n_batch_blks =
         (params.batch_sz + N_BATCH_LOOPS * result.n_stacks - 1) / (N_BATCH_LOOPS * result.n_stacks);
 
-    if(params.n_passes)
+    // guard not to grab too much system memory
+    while(n_batch_blks > 1 && wei_bstride * params.n_inputs * n_batch_blks > 4 * 1024 * 1024)
     {
-        result.passes = (n_batch_blks > 1) ? 2 : 1;
-        return result;
+        N_BATCH_LOOPS <<= 1;
+        assert((N_BATCH_LOOPS * result.n_stacks) != 0);
+        n_batch_blks = (params.batch_sz + N_BATCH_LOOPS * result.n_stacks - 1) /
+                       (N_BATCH_LOOPS * result.n_stacks);
     }
 
     // number of filter taps in the processing wk_item
@@ -149,21 +163,20 @@ ConvSolution ConvOclBwdWrW2::GetSolution(const ConvolutionContext& params,
     // each wave is a filter row
     int GRP_SZ = _hw_wave_sz * n_waves;
 
-    // inpout are outputs
-    int wei_cstride = params.kernel_size0 * params.kernel_size1;
-    int wei_bstride = params.n_outputs * wei_cstride;
-
     //	int read_unit = 6;
     std::string READ_TYPE = (read_unit == 1) ? "_FLOAT" : "_FLOAT" + std::to_string((read_unit));
 
     // input is output
+    assert(read_unit != 0);
     int ALIGNED_OUT_SCAN_LN = ((params.in_width + read_unit - 1) / read_unit); // image aligned scan
 
+    assert(N_ALIGNED_OUT_SCAN_BLK != 0);
     int N_OUT_BLK = (params.in_height + N_ALIGNED_OUT_SCAN_BLK - 1) / N_ALIGNED_OUT_SCAN_BLK;
 
-    int lcl_mem_sz = N_ALIGNED_OUT_SCAN_BLK * ALIGNED_OUT_SCAN_LN * read_unit +
-                     params.out_width * ((N_ALIGNED_OUT_SCAN_BLK - 1) * params.kernel_stride1 +
-                                         params.kernel_size1);
+    int lcl_mem_sz =
+        N_ALIGNED_OUT_SCAN_BLK * ALIGNED_OUT_SCAN_LN * read_unit +
+        (((params.out_width + read_unit - 1) / read_unit) * read_unit + params.kernel_size0 - 1) *
+            ((N_ALIGNED_OUT_SCAN_BLK - 1) * params.kernel_stride1 + params.kernel_size1);
     if(lcl_mem_sz > 8 * 1024)
     {
         return ConvSolution(miopenStatusNotInitialized);
@@ -183,10 +196,12 @@ ConvSolution ConvOclBwdWrW2::GetSolution(const ConvolutionContext& params,
     std::string UT_READ_TYPE =
         (ut_read_unit == 1) ? "_FLOAT" : "_FLOAT" + std::to_string((ut_read_unit));
 
+    if(!params.direction.IsBackwardWrW())
+        MIOPEN_THROW("!params.direction.IsBackwardWrW()");
     // it's backward - inputs are outputs and vs versa
     const auto comp_options =
-        std::string(" -DMLO_DIR_FORWARD=") + std::to_string((params.forward)) +
-        std::string(" -DMLO_GRP_SZ=") + std::to_string((GRP_SZ)) + std::string(" -DMLO_GRP_SZ0=") +
+        std::string(" -DMLO_DIR_FORWARD=0") + std::string(" -DMLO_GRP_SZ=") +
+        std::to_string((GRP_SZ)) + std::string(" -DMLO_GRP_SZ0=") +
         std::to_string((result.grp_tile0)) + std::string(" -DMLO_GRP_SZ1=") +
         std::to_string((result.grp_tile1)) + std::string(" -DMLO_GRP_SZ2=") +
         std::to_string((grp_tile2)) + std::string(" -DMLO_FILTER_SIZE0=") +
@@ -255,6 +270,7 @@ ConvSolution ConvOclBwdWrW2::GetSolution(const ConvolutionContext& params,
         // input is output
 
         size_t gbl_wk0 = GRP_SZ * params.n_outputs;
+        assert(total_out_maps != 0);
         size_t gbl_wk1 = ((params.n_inputs + total_out_maps - 1) / total_out_maps);
         size_t gbl_wk2 = n_batch_blks;
 
@@ -283,6 +299,7 @@ ConvSolution ConvOclBwdWrW2::GetSolution(const ConvolutionContext& params,
         kernel.l_wk.push_back(1);
         kernel.l_wk.push_back(1);
 
+        assert(ut_read_unit != 0);
         int gbl_ut_wk0 = wei_bstride * params.n_inputs / ut_read_unit;
 
         kernel.g_wk.push_back(gbl_ut_wk0);

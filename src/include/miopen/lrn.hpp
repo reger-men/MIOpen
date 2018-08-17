@@ -39,6 +39,7 @@ struct LRNDescriptor : miopenLRNDescriptor
 {
     LRNDescriptor();
     LRNDescriptor(miopenLRNMode_t m, unsigned int pn, const double* pparms);
+    LRNDescriptor(miopenLRNMode_t m, unsigned int pn, std::vector<double> pparms);
 
     miopenLRNMode_t GetMode() const;
     unsigned int GetN() const;
@@ -54,7 +55,7 @@ struct LRNDescriptor : miopenLRNDescriptor
                            const TensorDescriptor& yDesc,
                            Data_t y,
                            bool do_backward,
-                           Data_t workSpace);
+                           Data_t workSpace) const;
 
     miopenStatus_t Backward(Handle& handle,
                             const void* alpha,
@@ -67,7 +68,7 @@ struct LRNDescriptor : miopenLRNDescriptor
                             const void* beta,
                             const TensorDescriptor& dxDesc,
                             Data_t dx,
-                            ConstData_t workSpace);
+                            ConstData_t workSpace) const;
 
     friend std::ostream& operator<<(std::ostream& stream, const LRNDescriptor& x);
 

@@ -4,7 +4,6 @@ AMD's library for high peformance machine learning primitives. MIOpen supports t
 1. OpenCL 
 2. [HIP](https://github.com/ROCm-Developer-Tools/HIP)
 
-
 ## Prerequisites
 * A ROCm enabled platform, more info [here](https://rocm.github.io/install.html)
 * Base software stack, which includes
@@ -14,13 +13,36 @@ AMD's library for high peformance machine learning primitives. MIOpen supports t
     * [clang-ocl](https://github.com/RadeonOpenCompute/clang-ocl) -- **required**
 * [MIOpenGEMM](https://github.com/ROCmSoftwarePlatform/MIOpenGEMM) to enable various functionalities including transposed and dilated convolutions
 * ROCm cmake modules can be installed from [here](https://github.com/RadeonOpenCompute/rocm-cmake)
+* [Half](http://half.sourceforge.net/) - IEEE 754-based half-precision floating point library
 * [OpenSSL](https://www.openssl.org/) or [libressl](https://www.libressl.org/)
 * [Boost](http://www.boost.org/) at least version 1.58
   * MIOpen uses `boost-system` and `boost-filesystem` packages to enable persistent [kernel cache](https://github.com/ROCmSoftwarePlatform/MIOpen/blob/master/doc/src/cache.md)
 
-Instructions to install the above dependencies are present in this [section](#installing-the-dependencies).
+## Installing the dependencies
 
-## Configure with cmake
+The dependencies can be installed with the `install_deps.cmake`, script: `cmake -P install_deps.cmake`
+
+
+This will install by default to `/usr/local` but it can be installed in another location with `--prefix` argument:
+```
+cmake -P install_deps.cmake --prefix /some/local/dir
+```
+
+Instructions to manually install all the dependencies on Ubuntu v16 are present in this [section](#installing-the-dependencies-manually).
+
+## Installing MIOpen with pre-built packages
+
+MIOpen can be installed on Ubuntu using `apt-get`.
+
+For OpenCL backend: `apt-get install miopen-opencl`
+
+For HIP backend: `apt-get install miopen-hip`
+
+Currently both the backends cannot be installed on the same system simultaneously. If a different backend other than what currently exists on the system is desired, please remove the existing backend completely and then install the new backend.
+
+## Building MIOpen from source
+
+## Configuring with cmake
 
 First create a build directory:
 
@@ -58,6 +80,7 @@ CXX=/opt/rocm/hcc/bin/hcc cmake -DMIOPEN_BACKEND=HIP -DCMAKE_PREFIX_PATH="/opt/r
 CXX=/opt/rocm/hcc/bin/hcc cmake -DMIOPEN_BACKEND=HIP -DCMAKE_PREFIX_PATH="/opt/rocm/hcc;/opt/rocm/hip" ..
 ```
 
+#### Setting up locations
 
 By default the install location is set to '/opt/rocm', this can be set by using `CMAKE_INSTALL_PREFIX`:
 
@@ -65,11 +88,15 @@ By default the install location is set to '/opt/rocm', this can be set by using 
 cmake -DMIOPEN_BACKEND=OpenCL -DCMAKE_INSTALL_PREFIX=<miopen-installed-path> ..
 ```
 
-Also, the path to database for network configs can be set using the `MIOPEN_DB_PATH` variable. By default it is set to where the database files would be installed. For development purposes, setting `BUILD_DEV` will set the path to the database files stored in the source directory:
+The default path to the System PerfDb is `miopen/share/miopen/db/` within install location. The default path to the User PerfDb is `~/.config/miopen/`. For development purposes, setting `BUILD_DEV` will change default path to both database files to the source directory:
 
 ```
 cmake -DMIOPEN_BACKEND=OpenCL -DBUILD_DEV=On ..
 ```
+
+Database paths can be explicitly customized by means of `MIOPEN_DB_PATH` (System PerfDb) and `MIOPEN_USER_DB_PATH` (User PerfDb) cmake variables.
+
+#### Changing the cmake configuration
 
 The configuration can be changed after running cmake by using `ccmake`:
 
@@ -99,12 +126,6 @@ The driver can be built using the `MIOpenDriver` target:
 
 Documentation on how to run the driver is [here](https://github.com/ROCmSoftwarePlatform/MIOpen/blob/master/driver/README.md). 
 
-
-If building for HIP and `boost` was installed via `apt-get` in Ubuntu v16, add the following to the cmake line [above](#configure-with-cmake):
-```
--DMIOPEN_MAKE_BOOST_PUBLIC=ON
-```
-
 ## Running the tests
 
 The tests can be run by using the 'check' target:
@@ -115,12 +136,7 @@ A single test can be built and ran, by doing:
 
 ```
 cmake --build . --config Release --target test_tensor
-./test/test_tensor
-```
-
-If building for HIP and `boost` was installed via `apt-get` in Ubuntu v16, add the following to the cmake line [above](#configure-with-cmake):
-```
--DMIOPEN_MAKE_BOOST_PUBLIC=ON
+./bin/test_tensor
 ```
 
 ## Building the documentation
@@ -155,19 +171,7 @@ Also, githooks can be installed to format the code per-commit:
 ./.githooks/install
 ```
 
-## Installing the dependencies
-
-The dependencies can be installed with the `install_deps.cmake`, script:
-
-```
-cmake -P install_deps.cmake
-```
-
-This will install by default to `/usr/local` but it can be installed in another location with `--prefix` argument:
-
-```
-cmake -P install_deps.cmake --prefix /some/local/dir
-```
+## Installing the dependencies manually
 
 If Ubuntu v16 is used then the `OpenSSL` and `Boost` packages can also be installed by:
 ```
@@ -176,3 +180,15 @@ sudo apt-get install libboost-dev
 sudo apt-get install libboost-system-dev
 sudo apt-get install libboost-filesystem-dev
 ```
+
+`half` header needs to be installed from [here](http://half.sourceforge.net/). 
+
+## Using docker
+
+The easiest way is to use docker. You can build the top-level docker file:
+
+    docker build -t miopen .
+
+Then to enter the developement environment use `docker run`:
+
+    docker run --device='/dev/kfd' --device='/dev/dri' -v=`pwd`:/data -w /data --group-add video -it miopen

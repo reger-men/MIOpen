@@ -35,7 +35,7 @@
 #define MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR 0
 #endif
 
-int pick_batch_size(int x, int y)
+inline int pick_batch_size(int x, int y)
 {
     if(y == 0)
         return 1;
@@ -45,11 +45,14 @@ int pick_batch_size(int x, int y)
         return x / y;
 }
 
-std::set<std::vector<int>> get_inputs(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR)
+inline std::set<std::vector<int>> get_inputs(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR)
 {
     // clang-format off
     return 
     {
+        { pick_batch_size(32,  n), 1,    14,  14  },
+        { pick_batch_size(100, n), 1,    8,   8   },
+        { pick_batch_size(256, n), 1,    27,  27  },
         { pick_batch_size(100, n), 19,   1024,2048},
         { pick_batch_size(100, n), 3,    32,  32  },
         { pick_batch_size(100, n), 32,   16,  16  },
@@ -72,8 +75,8 @@ std::set<std::vector<int>> get_inputs(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FAC
         { pick_batch_size(32, n),  16,   28,  28  },
         { pick_batch_size(32, n),  160,  14,  14  },
         { pick_batch_size(32, n),  160,  7,   7   },
-        { pick_batch_size(32, n),  192,  128, 256 },
 #if MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR > 0
+        { pick_batch_size(32, n),  192,  128, 256 },
         { pick_batch_size(32, n),  192,  256, 512 },
 #endif
         { pick_batch_size(32, n),  192,  28,  28  },
@@ -130,7 +133,7 @@ std::set<std::vector<int>> get_inputs(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FAC
     // clang-format on
 }
 
-std::set<std::vector<int>> get_weights(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR)
+inline std::set<std::vector<int>> get_weights(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR)
 {
     // clang-format off
     return 
@@ -249,7 +252,8 @@ std::set<std::vector<int>> get_weights(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FA
     // clang-format on
 }
 
-std::set<std::vector<int>> get_bn_peract_inputs(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR)
+inline std::set<std::vector<int>>
+get_bn_peract_inputs(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR)
 {
     // clang-format off
     return 
@@ -289,7 +293,7 @@ std::set<std::vector<int>> get_bn_peract_inputs(int n = MIOPEN_TEST_DEFAULT_BATC
         { pick_batch_size(32, n),  64,   28,  28  },
         { pick_batch_size(32, n),  64,   56,  56  },
         { pick_batch_size(32, n),  96,   28,  28  },
-        { pick_batch_size(32, n),  192,  256, 512 },
+        { pick_batch_size(32, n),  32,  256,  512 }, //Killing this config. Takes way too long on the CPU
         { pick_batch_size(32, n),  256,  28,  28  },
         { pick_batch_size(32, n),  3,    224, 224 },
         { pick_batch_size(32, n),  480,  128, 256 },
@@ -298,7 +302,8 @@ std::set<std::vector<int>> get_bn_peract_inputs(int n = MIOPEN_TEST_DEFAULT_BATC
     // clang-format on
 }
 
-std::set<std::vector<int>> get_bn_spatial_inputs(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR)
+inline std::set<std::vector<int>>
+get_bn_spatial_inputs(int n = MIOPEN_TEST_DEFAULT_BATCH_SIZE_FACTOR)
 {
     // clang-format off
     return 
@@ -308,8 +313,9 @@ std::set<std::vector<int>> get_bn_spatial_inputs(int n = MIOPEN_TEST_DEFAULT_BAT
         { pick_batch_size(32, n),  480,  128, 256 },
         { pick_batch_size(256, n), 3,    227, 227 },
         { pick_batch_size(256, n), 64,   112, 112 },
+        { pick_batch_size(512, n), 16,   32,  32  },
         { pick_batch_size(32, n),  64,   112, 112 },
-        { pick_batch_size(100, n), 3,    32,  32  },
+        //{ pick_batch_size(100, n), 3,    32,  32  },// causing issues with Jenkins
         { pick_batch_size(100, n), 32,   8,   8   },
         { pick_batch_size(128, n), 256,  12,  12  },
         { pick_batch_size(256, n), 1024, 14,  14  },// n is from the paper @ 256
@@ -340,11 +346,32 @@ std::set<std::vector<int>> get_bn_spatial_inputs(int n = MIOPEN_TEST_DEFAULT_BAT
         { pick_batch_size(32, n),  64,   56,  56  },
         { pick_batch_size(32, n),  96,   28,  28  },
         { pick_batch_size(32, n),  192,  256, 512 },
-        //{ pick_batch_size(32, n),  256,  28,  28  },
+        { pick_batch_size(32, n),  256,  28,  28  },
         { pick_batch_size(32, n),  3,    224, 224 },
         { pick_batch_size(32, n),  480,  128, 256 },
         { pick_batch_size(32, n),  528,  64,  128 }
     };
     // clang-format on
 }
+
+inline std::vector<std::vector<int>> get_sub_tensor()
+{
+    return {{16, 4, 8, 1, 4},
+            {2, 4, 8, 8, 4},
+            {16, 4, 8, 4},
+            {13, 8, 4, 8},
+            {3, 8, 7},
+            {16, 4, 10},
+            {3, 8},
+            {16, 4},
+            {4}};
+}
+
+inline std::vector<std::vector<int>> get_tensor_offsets()
+{
+    return {{0, 0}, {0, 2}, {4, 0}, {5, 7}};
+}
+
+inline std::vector<int> get_tensor_offset() { return {0, 1, 2, 3, 4, 5}; }
+
 #endif

@@ -95,37 +95,6 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <cstdint>
 #include <tuple>
 
-#ifdef _WIN32
-#include <io.h>
-#include <windows.h>
-// #include <BaseTsd.h>
-#include <direct.h>
-#define snprintf _snprintf
-#define vsnprintf _vsnprintf
-#define strcasecmp _stricmp
-#define strncasecmp _strnicmp
-//#ifndef getcwd
-// #define getcwd _getcwd
-//#endif
-typedef unsigned int uint;
-
-#ifndef getcwd
-#define getcwd _getcwd
-#endif
-
-#else // !WIN32 so Linux and APPLE
-#include <climits>
-#include <unistd.h>
-#include <cstdbool>
-#include <sys/time.h>
-#include <sys/resource.h>
-using __int64 = long long;
-#ifndef fopen_s
-#define fopen_s(file, fileName, mode) ((*(file)) = fopen((fileName), (mode))) == nullptr
-#endif
-
-#endif
-
 using mlo_kernel_info = std::tuple<const std::string,
                                    const std::string,
                                    const std::string,
@@ -139,6 +108,8 @@ using mlo_kernel_info = std::tuple<const std::string,
 #endif
 #include <miopen/tensor.hpp>
 #include <miopen/handle.hpp>
+#include <miopen/db_path.hpp>
+#include <miopen/db.hpp>
 
 inline int mloLg2(int v)
 {
@@ -152,199 +123,208 @@ inline int AlignUp(int val, unsigned step)
     return ((val + step - 1) / step) * step;
 }
 
-enum rocm_meta_version
+enum class rocm_meta_version
 {
+    Unknown,
     V1,
     V2,
-    V3
+    V3,
+    AMDHSA_1_0,   // 1.0, see https://llvm.org/docs/AMDGPUUsage.html#code-object-metadata
+    Default = V3, // Assumption for HIP backend. To be updated together with ROCm release.
 };
 
 namespace miopen {
+
+template <class TInstance>
+class StaticContainer
+{
+    public:
+    inline static TInstance& Instance()
+    {
+        static TInstance data{};
+        return data;
+    }
+};
+
+struct ProblemDescription
+{
+    int n_inputs         = 0;
+    int in_height        = 0;
+    int in_width         = 0;
+    int kernel_size1     = 0;
+    int kernel_size0     = 0;
+    int n_outputs        = 0;
+    int out_height       = 0;
+    int out_width        = 0;
+    int batch_sz         = 0;
+    int pad0             = 0;
+    int pad1             = 0;
+    int kernel_stride0   = 0;
+    int kernel_stride1   = 0;
+    int kernel_dilation0 = 0;
+    int kernel_dilation1 = 0;
+    int bias             = 0;
+    std::string in_layout;
+    std::string in_data_type;
+    std::string weights_layout;
+    std::string out_data_type;
+    std::string out_layout;
+    int float_size         = 32;
+    size_t bot_sz          = 0;
+    size_t top_sz          = 0;
+    size_t weights_sz      = 0;
+    size_t bias_sz         = 0;
+    int deconvolution      = 0;
+    int in_stride          = 0;
+    int out_stride         = 0;
+    int in_channel_stride  = 0;
+    int in_batch_stride    = 0;
+    int out_channel_stride = 0;
+    int out_batch_stride   = 0;
+    struct Direction
+    {
+        enum class Value
+        {
+            Unknown,
+            Forward,
+            Backward,
+            BackwardWrW,
+        };
+
+        private:
+        Value v = Value::Unknown;
+
+        public:
+        bool IsKnown() const { return v != Value::Unknown; }
+        bool IsForward() const { return v == Value::Forward; }
+        bool IsBackwardData() const { return v == Value::Backward; } // Syntax glue.
+        bool IsBackwardWrW() const { return v == Value::BackwardWrW; }
+        void Set(int forward)
+        {
+            assert(0 <= forward && forward <= 1);
+            v = forward != 0 ? Value::Forward : Value::Backward;
+        }
+        template <typename T>
+        void Set(T) = delete;
+        void SetBackwardWrW() { v = Value::BackwardWrW; }
+    } direction;
+    int GetBackwardPad0() const { return kernel_size0 - pad0 - 1; }
+    int GetBackwardPad1() const { return kernel_size1 - pad1 - 1; }
+
+    void Serialize(std::ostream& stream) const
+    {
+        if(!direction.IsKnown())
+            MIOPEN_THROW("!direction.IsKnown()");
+        const auto sep = '-';
+        // clang-format off
+        // 576-4-4-1x1-192-4-4-8-1x1-2x2-3x3-0-NCHW-FP32-F
+        stream
+            << n_inputs << sep << in_height << sep << in_width
+            << sep << kernel_size1 << 'x' << kernel_size0
+            << sep << n_outputs << sep << out_height << sep << out_width
+            << sep << batch_sz
+            << sep << pad1 << 'x' << pad0
+            << sep << kernel_stride1 << 'x' << kernel_stride0
+            << sep << kernel_dilation1 << 'x' << kernel_dilation1
+            << sep << bias
+            << sep << in_layout
+            << sep << in_data_type
+            << sep << (direction.IsForward() ? "F"
+                     : direction.IsBackwardData() ? "B" : "W"); // clang-format on
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const ProblemDescription& obj)
+    {
+        obj.Serialize(os);
+        return os;
+    }
+};
 
 /// A leftover of the legacy design, houses problem config,
 /// environmental context (e.g. HW/SW platform) and solver-specific state.
 ///
 /// TODO: These three entities should be made separate.
-class ConvolutionContext
+struct ConvolutionContext : ProblemDescription
 {
-    public:
-    bool n_passes = false;
-
-    bool forward;
-    bool do_search           = false;
-    bool save_srch_req       = false;
-    bool assembler_available = false;
-    bool use_binaries        = true;
-    std::string weights_layout;
-    std::string in_layout;
-    std::string in_data_type;
-    std::string out_data_type;
-    std::string out_layout;
-    size_t bot_sz, top_sz, weights_sz, bias_sz;
-    int pad0, pad1;
-    int kernel_stride0, kernel_stride1;
-    int kernel_size0, kernel_size1;
-    int kernal_dilation0, kernal_dilation1;
-    int deconvolution;
-    int n_inputs, n_outputs;
-    int in_width, in_height;
-    int out_width, out_height;
-    int in_stride, out_stride;
-    int in_channel_stride, in_batch_stride;
-    int out_channel_stride, out_batch_stride;
-    int batch_sz;
-    int bias;
-    int n_timer_iter = 0;
-    rocm_meta_version rmv;
+    // Solution-specific
     std::string general_compile_options;
-
-    ConvolutionContext()
-        : forward(),
-          bot_sz(),
-          top_sz(),
-          weights_sz(),
-          bias_sz(),
-          pad0(),
-          pad1(),
-          kernel_stride0(),
-          kernel_stride1(),
-          kernel_size0(),
-          kernel_size1(),
-          kernal_dilation0(),
-          kernal_dilation1(),
-          deconvolution(),
-          n_inputs(),
-          n_outputs(),
-          in_width(),
-          in_height(),
-          out_width(),
-          out_height(),
-          in_stride(),
-          out_stride(),
-          in_channel_stride(),
-          in_batch_stride(),
-          out_channel_stride(),
-          out_batch_stride(),
-          batch_sz(),
-          bias(),
-          rmv(),
-          _stream()
-    {
-    }
+    // Operation modes & environment
+    bool do_search                         = false;
+    bool save_srch_req                     = false;
+    bool use_asm_kernels                   = false;
+    bool use_binaries                      = true;
+    rocm_meta_version rmv                  = rocm_meta_version::Default;
+    bool workaround_disable_search_enforce = false;
 
     inline Handle& GetStream() const { return *_stream; }
     inline void SetStream(Handle* stream) { _stream = stream; }
 
+    std::string GetPerfDbPath() const
+    {
+        // clang-format off
+        return GetDbPath()
+             + "/"
+             + GetStream().GetDeviceName()
+             + "_"
+             + std::to_string(GetStream().GetMaxComputeUnits())
+             + ".cd.pdb.txt";
+        // clang-format on
+    }
+
+    std::string GetUserPerfDbPath() const
+    {
+        // clang-format off
+        return GetUserDbPath()
+             + "/"
+             + GetStream().GetDeviceName()
+             + "_"
+             + std::to_string(GetStream().GetMaxComputeUnits())
+             + ".cd.updb.txt";
+        // clang-format on
+    }
+
     private:
-    Handle* _stream;
+    Handle* _stream = nullptr;
 };
 
 namespace solver {
-class ConvSolution;
-class Solver;
+struct ConvSolution;
+
 } // namespace solver
 
 } // namespace miopen
 
-class mlo_construct_direct2D
+template <class T>
+auto mloConstruct(T& x) -> decltype(x.mloConstruct(), void())
 {
-    public:
-    virtual const std::vector<std::reference_wrapper<const miopen::solver::Solver>>&
-    SolverStore() const;
-    void mloUseSolution(const miopen::solver::ConvSolution& s);
+    x.setupFloats();
+    x.mloConstruct();
+}
 
-    mlo_construct_direct2D(int dir, bool do_bias = false)
-    {
-        _search_params.forward = dir;
-        _do_backward           = false;
+template <class T>
+auto FindFirstSolution(T& x) -> decltype(x.FindSolution())
+{
+    x.setupRocm();
+    x.setupFloats();
+    return x.FindSolution();
+}
 
-        //#if !(defined(__APPLE__) || defined(__MACOSX))
-        //	_gen_comp_options = std::string(" -cl-std=CL2.0 ");
-        //#endif
-        _in_tile0 = (_search_params.in_width < 12) ? 8 : 16; //(_in_width < 12) ? 8 : (_in_width <
-                                                             // 24 || (_in_width > 32 && _in_width <
-        // 48)) ? 16 : 32; // size of input data
-        // per ALU plane
-        _in_tile1 = (_search_params.in_height < 12) ? 8 : 16; // (_in_height < 12) ? 8 : (_in_height
-                                                              // < 24 || (_in_height > 32 &&
-                                                              // _in_height < 48)) ? 16 : 32; //
-                                                              // size of input data per ALU plane
+template <class T>
+auto FindAllSolutions(T& x) -> decltype(x.FindAllSolutions())
+{
+    x.setupRocm();
+    x.setupFloats();
+    return x.FindAllSolutions();
+}
 
-        _grp_tile0 = _in_tile0;
-        _grp_tile1 = _in_tile1;
-
-        _out_pix_tile0 = 2; // size of ouptput tile per wk-item (ALU))
-        _out_pix_tile1 = 4; //
-
-        _n_out_pix_tiles = 2; // # output pixel tiles per wk-item (ALU)
-        _n_in_data_tiles = 4; // # of blocks of different inputs in LDS
-
-        _n_stacks                       = 1; // # of diff stacks (part of batch).
-        _search_params.bias             = (do_bias) ? 1 : 0;
-        _search_params.pad0             = 1;
-        _search_params.pad1             = 1;
-        _search_params.kernel_size0     = 3;
-        _search_params.kernel_size1     = 3;
-        _search_params.kernel_stride0   = 1;
-        _search_params.kernel_stride1   = 1;
-        _search_params.kernal_dilation0 = 1;
-        _search_params.kernal_dilation1 = 1;
-        _search_params.deconvolution    = 0;
-        _search_params.bot_sz           = 0; // bytes
-        _search_params.top_sz           = 0; // bytes
-        _search_params.weights_sz       = 0; // bytes
-        _search_params.bias_sz          = 0; // bytes
-
-        _workspce_sz = 0;
-
-        _small         = true;
-        _copy_input    = false;
-        _new_in_width  = 0;
-        _new_in_height = 0;
-        _new_in_sz     = 0;
-    }
-
-    virtual ~mlo_construct_direct2D() = default;
-    /*
-    * major interface
-    * it has to be called only after
-    * convolutional parmeters, input, output and weight tesnor have been set
-    *
-    * constructs compiler option
-    *
-    * selects kernel file and name
-    * covers genrinc forward convolution:
-    * arbitrary combination of kerenl sizes, strides
-    */
-
-    /// \todo The function is never called through the vtable. Remove "virtual". Consider moving
-    /// into ctor, if possible.
-    virtual int mloConstruct();
-
-    /*
-    * returns parameter values that are compiled in legacy kernels for kernels using them as
-    * arguments.
-    */
-    inline void getCompiledInParameters(
-        int* N, int* C, int* H, int* W, int* K, int* n_groups, int* R = nullptr, int* S = nullptr)
-    {
-        assert(N && C && H && W && K && n_groups);
-
-        *N        = _search_params.batch_sz;
-        *C        = _search_params.n_inputs;
-        *H        = _search_params.in_height;
-        *W        = _search_params.in_width;
-        *K        = _search_params.n_outputs;
-        *n_groups = _search_params.GetStream().GetMaxComputeUnits();
-        if(R)
-        {
-            *R = _search_params.kernel_size1;
-        } // R is height (sic!)
-        if(S)
-        {
-            *S = _search_params.kernel_size0;
-        }
-    }
+/// \todo Move this into respective Solution objects. --atamazov
+struct mlo_construct_activ_lrn_pooling_common
+{
+    std::string _comp_options;
+    std::string _kernel_file;
+    std::string _kernel_name;
+    std::vector<size_t> _l_wk;
+    std::vector<size_t> _g_wk;
 
     /*
     * returns kernel file name without location
@@ -357,7 +337,6 @@ class mlo_construct_direct2D
     /*
     * return set of compile options
     */
-
     inline const std::string& getCompilerOptions() const { return (_comp_options); }
     /*
     *  return a local working configuration
@@ -368,6 +347,116 @@ class mlo_construct_direct2D
     */
     inline const std::vector<size_t>& getGlobalWkSize() const { return (_g_wk); }
 
+    int _grp_tile0      = 8; // total number ALUs per group
+    int _grp_tile1      = 8; // total number ALUs per group
+    int _out_pix_tile0  = 2; // # of generated pixels per output per wk-item  (ALU)
+    int _out_pix_tile1  = 4; // # of generated pixels per output per wk-item  (ALU)
+    size_t _workspce_sz = 0;
+
+    /*
+    * get workspace size
+    */
+    inline size_t getWorkSpaceSzBytes() const { return (_workspce_sz); }
+};
+
+struct mlo_construct_direct2D
+{
+    mlo_construct_direct2D(int dir, bool do_bias = false)
+    {
+        _search_params.direction.Set(dir);
+        _search_params.bias             = (do_bias) ? 1 : 0;
+        _search_params.pad0             = 1;
+        _search_params.pad1             = 1;
+        _search_params.kernel_size0     = 3;
+        _search_params.kernel_size1     = 3;
+        _search_params.kernel_stride0   = 1;
+        _search_params.kernel_stride1   = 1;
+        _search_params.kernel_dilation0 = 1;
+        _search_params.kernel_dilation1 = 1;
+        _search_params.deconvolution    = 0;
+        _search_params.bot_sz           = 0; // bytes
+        _search_params.top_sz           = 0; // bytes
+        _search_params.weights_sz       = 0; // bytes
+        _search_params.bias_sz          = 0; // bytes
+    }
+
+    void setupRocm();
+    void setupFloats();
+
+    /*
+    * major interface
+    * it has to be called only after
+    * convolutional parmeters, input, output and weight tesnor have been set
+    *
+    * constructs compiler option
+    *
+    * selects kernel file and name
+    * covers genrinc forward convolution:
+    * arbitrary combination of kerenl sizes, strides
+    */
+
+    miopen::solver::ConvSolution FindSolution();
+    std::vector<miopen::solver::ConvSolution> FindAllSolutions();
+    miopen::MultiFileDb GetDb() const;
+
+    /*
+    * returns parameter values that are compiled in legacy kernels for kernels using them as
+    * arguments.
+    */
+    inline void getCompiledInParameters(int* const N,
+                                        int* const C,
+                                        int* const H,
+                                        int* const W,
+                                        int* const K,
+                                        int* const n_groups) const
+    {
+        assert(N && C && H && W && K && n_groups);
+        *N        = _search_params.batch_sz;
+        *C        = _search_params.n_inputs;
+        *H        = _search_params.in_height;
+        *W        = _search_params.in_width;
+        *K        = _search_params.n_outputs;
+        *n_groups = _search_params.GetStream().GetMaxComputeUnits();
+    }
+
+    inline void getCompiledInParameters(int* const N,
+                                        int* const C,
+                                        int* const H,
+                                        int* const W,
+                                        int* const K,
+                                        int* const n_groups,
+                                        int* const out_H,
+                                        int* const out_W) const
+    {
+        getCompiledInParameters(N, C, H, W, K, n_groups);
+        assert(out_H && out_W);
+        *out_H = _search_params.out_height;
+        *out_W = _search_params.out_width;
+    }
+
+    inline void getCompiledInParameters(int* const N,
+                                        int* const C,
+                                        int* const H,
+                                        int* const W,
+                                        int* const K,
+                                        int* const n_groups,
+                                        int* const out_H,
+                                        int* const out_W,
+                                        int* const R,
+                                        int* const S,
+                                        int* const pad_H,
+                                        int* const pad_W) const
+    {
+        getCompiledInParameters(N, C, H, W, K, n_groups, out_H, out_W);
+        assert(R && S && pad_H && pad_W);
+        *R     = _search_params.kernel_size1;
+        *S     = _search_params.kernel_size0;
+        *pad_H = _search_params.direction.IsForward() ? _search_params.pad1
+                                                      : _search_params.GetBackwardPad1();
+        *pad_W = _search_params.direction.IsForward() ? _search_params.pad0
+                                                      : _search_params.GetBackwardPad0();
+    }
+
     /*
     * get common compiler options
     */
@@ -377,49 +466,24 @@ class mlo_construct_direct2D
     }
 
     /*
-    * get info for all kernels of the layer
-    * std::string _kernel_name;
-    * std::string _kernel_file;
-    * std::string _comp_options;
-    * std::vector<size_t> _g_wk;
-    * std::vector<size_t> _l_wk;
+    * return direction: true - forward, false - backward
     */
-
-    inline const std::vector<mlo_kernel_info>& getKernelsInfo() const
+    inline bool isForwardDirection() const
     {
-        return (_mlo_kernels_info);
+        if(!_search_params.direction.IsKnown())
+            MIOPEN_THROW("!_search_params.direction.IsKnown()");
+        return _search_params.direction.IsForward(); // convolutions: backward data OR wrw otherwise
     }
 
     /*
-    * return direction: true - forward, false - backward
-    */
-    inline bool isForwardDirection() const { return (_search_params.forward == 1); }
-
-    /*
-    * get workspace size
-    */
-    inline size_t getWorkSpaceSzBytes() const { return (_workspce_sz); }
-    /*
     *  is bias incuded
     */
-
     inline bool doBias() const { return (_search_params.bias == 1); }
-
-    /*
-    * set a number of iteration for thwe wall clock performance meaturement
-    */
-
-    inline void setTimerIter(int n_timer_iter) { _search_params.n_timer_iter = n_timer_iter; }
 
     /*
     * set library stream
     */
     inline void setStream(miopen::Handle* stream) { _search_params.SetStream(stream); }
-
-    /*
-    * set ocl Kernels path
-    */
-    inline void setKernelPath(const std::string& kernel_path) { _kernel_path = kernel_path; }
 
     /*
     * set convolutional parameters
@@ -455,6 +519,7 @@ class mlo_construct_direct2D
         _search_params.kernel_size0 = width;
         _search_params.kernel_size1 = height;
         int data_len                = (data_type == "FP32" ? 4 : 8);
+        _search_params.float_size   = (data_type == "FP32" ? 32 : 16);
         size_t size                 = (layout == "NCHW")
                           ? batch * depth * height * width * data_len
                           : batch * batch_stride * channel_stride * stride * w_stride * data_len;
@@ -475,12 +540,13 @@ class mlo_construct_direct2D
                                int stride,
                                int w_stride)
     {
-        _search_params.batch_sz = batch;
-        int data_len            = (data_type == "FP32" ? 4 : 8);
-        size_t size             = (layout == "NCHW")
+        _search_params.batch_sz   = batch;
+        int data_len              = (data_type == "FP16") ? 2 : (data_type == "FP32") ? 4 : 8;
+        _search_params.float_size = (data_type == "FP32" ? 32 : 16);
+        size_t size               = (layout == "NCHW")
                           ? batch * depth * height * width * data_len
                           : batch * batch_stride * channel_stride * stride * w_stride * data_len;
-        if(_search_params.forward)
+        if(_search_params.direction.IsForward())
         {
 
             _search_params.out_width          = width;
@@ -524,12 +590,13 @@ class mlo_construct_direct2D
                               int stride,
                               int w_stride)
     {
-        _search_params.batch_sz = batch;
-        int data_len            = (data_type == "FP32" ? 4 : 8);
-        size_t size             = (layout == "NCHW")
+        _search_params.batch_sz   = batch;
+        int data_len              = (data_type == "FP16") ? 2 : (data_type == "FP32") ? 4 : 8;
+        _search_params.float_size = (data_type == "FP32" ? 32 : 16);
+        size_t size               = (layout == "NCHW")
                           ? batch * depth * height * width * data_len
                           : batch * batch_stride * channel_stride * stride * w_stride * data_len;
-        if(_search_params.forward)
+        if(_search_params.direction.IsForward())
         {
 
             _search_params.in_width          = width;
@@ -557,7 +624,8 @@ class mlo_construct_direct2D
             _search_params.out_data_type      = data_type;
         }
 
-        _search_params.bias_sz = (_search_params.bias) ? _search_params.n_outputs * data_len : 0;
+        _search_params.bias_sz =
+            (_search_params.bias) != 0 ? _search_params.n_outputs * data_len : 0;
     }
 
     /*
@@ -574,9 +642,10 @@ class mlo_construct_direct2D
                      int stride,
                      int w_stride)
     {
-        _search_params.batch_sz = batch;
-        int data_len            = (data_type == "FP32" ? 4 : 8);
-        size_t size             = (layout == "NCHW")
+        _search_params.batch_sz   = batch;
+        int data_len              = (data_type == "FP16") ? 2 : (data_type == "FP32") ? 4 : 8;
+        _search_params.float_size = (data_type == "FP32" ? 32 : 16);
+        size_t size               = (layout == "NCHW")
                           ? batch * depth * height * width * data_len
                           : batch * batch_stride * channel_stride * stride * w_stride * data_len;
 
@@ -589,7 +658,8 @@ class mlo_construct_direct2D
         _search_params.top_sz             = size;
         _search_params.out_layout         = layout;
         _search_params.out_data_type      = data_type;
-        _search_params.bias_sz = (_search_params.bias) ? _search_params.n_outputs * data_len : 0;
+        _search_params.bias_sz =
+            (_search_params.bias != 0) ? (_search_params.n_outputs * data_len) : 0;
     }
 
     /*
@@ -607,9 +677,10 @@ class mlo_construct_direct2D
                      int stride,
                      int w_stride)
     {
-        _search_params.batch_sz = batch;
-        int data_len            = (data_type == "FP32" ? 4 : 8);
-        size_t size             = (layout == "NCHW")
+        _search_params.batch_sz   = batch;
+        int data_len              = (data_type == "FP16") ? 2 : (data_type == "FP32") ? 4 : 8;
+        _search_params.float_size = (data_type == "FP32" ? 32 : 16);
+        size_t size               = (layout == "NCHW")
                           ? batch * depth * height * width * data_len
                           : batch * batch_stride * channel_stride * stride * w_stride * data_len;
 
@@ -625,7 +696,6 @@ class mlo_construct_direct2D
         //			_tens_layout = layout;
         //			_tens_data_format = data_type;
     }
-
     /*
     * set top df tensor
     */
@@ -640,9 +710,10 @@ class mlo_construct_direct2D
                        int stride,
                        int w_stride)
     {
-        _search_params.batch_sz = batch;
-        int data_len            = (data_type == "FP32" ? 4 : 8);
-        size_t size             = (layout == "NCHW")
+        _search_params.batch_sz   = batch;
+        int data_len              = (data_type == "FP16") ? 2 : (data_type == "FP32") ? 4 : 8;
+        _search_params.float_size = (data_type == "FP32" ? 32 : 16);
+        size_t size               = (layout == "NCHW")
                           ? batch * depth * height * width * data_len
                           : batch * batch_stride * channel_stride * stride * w_stride * data_len;
 
@@ -672,9 +743,10 @@ class mlo_construct_direct2D
                        int stride,
                        int w_stride)
     {
-        _search_params.batch_sz = batch;
-        int data_len            = (data_type == "FP32" ? 4 : 8);
-        size_t size             = (layout == "NCHW")
+        _search_params.batch_sz   = batch;
+        int data_len              = (data_type == "FP16") ? 2 : (data_type == "FP32") ? 4 : 8;
+        _search_params.float_size = (data_type == "FP32" ? 32 : 16);
+        size_t size               = (layout == "NCHW")
                           ? batch * depth * height * width * data_len
                           : batch * batch_stride * channel_stride * stride * w_stride * data_len;
 
@@ -701,11 +773,7 @@ class mlo_construct_direct2D
     /*
     *  allow the search for the best possible solution
     */
-    inline void doSearch(bool do_search) { _search_params.do_search = do_search; }
-    /*
-    * is search set?
-    */
-    inline bool doSearch() const { return (_search_params.do_search); }
+    inline void setDoSearch(const bool do_search) { _search_params.do_search = do_search; }
 
     /*
     * allow to save the missing configuraion in the search request file for an offline search
@@ -719,10 +787,13 @@ class mlo_construct_direct2D
         _search_params.general_compile_options += options;
     }
 
+    inline void setWorkaroundDisableSearchEnforce(bool v)
+    {
+        _search_params.workaround_disable_search_enforce = v;
+    }
+
     // MD: Hack to get the key outside of mlo_internal
     int mloBuildConf_Key(std::string& conf_key) const;
-
-    inline bool doCopyInput() const { return (_copy_input); }
 
     // MD: Where is this being used?
     void getNewInputDescr(std::string& layout,
@@ -741,26 +812,25 @@ class mlo_construct_direct2D
     size_t setInputDescFromMLDesc(const miopen::TensorDescriptor& input_tensor);
     size_t setOutputDescFromMLDesc(const miopen::TensorDescriptor& output_tensor);
     size_t setWeightDescFromMLDesc(const miopen::TensorDescriptor& weight_tensor);
+    size_t setTopDescFromMLDesc(const miopen::TensorDescriptor& tensor);
+    size_t setBotDescFromMLDesc(const miopen::TensorDescriptor& tensor);
+    size_t setTopDfDescFromMLDesc(const miopen::TensorDescriptor& tensor);
+    size_t setBotDfDescFromMLDesc(const miopen::TensorDescriptor& tensor);
 
-    bool mloIsCompilerWorkarounds() const;
     bool mloIsFastBinaryWinograd3x3U() const;
 
-    inline void mloCopyTo(miopen::ConvolutionContext& params) const /// TODO: get rid of this
+    std::string db_path() const
     {
-        params = _search_params;
+        return _db_path != nullptr ? _db_path : _search_params.GetPerfDbPath();
     }
-
-    protected:
-    bool mloIsAmdOpenclRocm(rocm_meta_version& rmv) const;
 
     int mloConstructBwd() { return (0); }
     int mloConstructFwd() { return (0); }
 
-    //	int mloBuildConf_Key(std::string & conf_key) const;
-
     protected:
     miopen::ConvolutionContext _search_params;
 
+    /// \todo <begin> Move these into respective Contexts (norm, pooling, neuron...) --atamazov
     int _in_df_width          = 0;
     int _in_df_height         = 0;
     int _in_df_batch_stride   = 0;
@@ -777,95 +847,51 @@ class mlo_construct_direct2D
     std::string _out_df_layout;
     std::string _out_df_data_type;
 
-    // SP
+    bool _do_backward = false;
 
-    bool _small;
-    bool _copy_input;
-    int _new_in_height;
-    int _new_in_width;
-    int _new_in_batch_stride   = 0;
-    int _new_in_channel_stride = 0;
-    int _new_in_stride         = 0;
-    size_t _new_in_sz;
-    bool _do_backward;
-
-    // FIX IT
-    //	int _weights_height;
-    //	int _weights_stride;
-    std::string _weight_data_type;
-    //
-    //	std::string _tens_layout;
-    //	std::string _tens_data_format;
-
-    int _in_tile0        = 0; // size of in-tile in local memory
-    int _in_tile1        = 0; // size of in-tile in local memory
-    int _grp_tile0       = 0; // total number ALUs per group
-    int _grp_tile1       = 0; // total number ALUs per group
-    int _out_pix_tile0   = 0; // # of generated pixels per output per wk-item  (ALU)
-    int _out_pix_tile1   = 0; // # of generated pixels per output per wk-item  (ALU)
-    int _n_out_pix_tiles = 0; // # output pixel tiles per wk-item (ALU)
-    int _n_in_data_tiles = 0; // # of blocks of different inputs in LDS
-    int _n_stacks        = 0; // # of diff stacks (part of batch).
-    std::string _comp_options;
-    std::string _kernel_file;
-    std::string _kernel_name;
-    std::vector<size_t> _l_wk;
-    std::vector<size_t> _g_wk;
-
-    // more than 1 kerenls per stage
-    std::vector<mlo_kernel_info> _mlo_kernels_info;
-
-    bool _gen  = false; // genral case
-    int _quiet = 0;
-    std::string _kernel_path;
     // local memory size per group
-    size_t _dev_local_mem_sz = 0;
+    size_t _dev_local_mem_sz = 0; /// \todo Written but not read - remove?
     // wave size
     int _hw_wave_sz = 0;
     // cl_queue
-    size_t _bot_df_sz = 0; // bytes
-    size_t _top_df_sz = 0; // bytes
+    size_t _bot_df_sz = 0; /// \todo Written but not read - remove?
+    size_t _top_df_sz = 0; /// \todo Written but not read - remove?
+    /// \todo <end>
 
-    size_t _workspce_sz;
-
-    unsigned int _n_groups{};
+    const char* _db_path = nullptr;
 };
 
 /*
 * backward with regard to weights construction
 */
 
-class mlo_construct_BwdWrW2D : public mlo_construct_direct2D
+struct mlo_construct_BwdWrW2D : mlo_construct_direct2D
 {
-    public:
-    mlo_construct_BwdWrW2D(int dir, bool do_bias = false) : mlo_construct_direct2D(dir, do_bias) {}
+    mlo_construct_BwdWrW2D(int dir, bool do_bias = false) : mlo_construct_direct2D(dir, do_bias)
+    {
+        _search_params.direction.SetBackwardWrW();
+    }
 
-    bool mloIsCompilerWorkarounds() const;
-    int mloMultiStep();
-    const std::vector<std::reference_wrapper<const miopen::solver::Solver>>&
-    SolverStore() const override;
+    std::vector<miopen::solver::ConvSolution> FindAllSolutions();
 };
 
 /*
 * winograd algorithm
 */
 
-class mlo_construct_winograd : public mlo_construct_direct2D
+struct mlo_construct_winograd : mlo_construct_direct2D
 {
-    public:
     mlo_construct_winograd(int dir, bool do_bias = false) : mlo_construct_direct2D(dir, do_bias) {}
 
-    const std::vector<std::reference_wrapper<const miopen::solver::Solver>>&
-    SolverStore() const override;
+    miopen::solver::ConvSolution FindSolution();
 };
 
 #define MLO_POOLING_OP_AVE 0
 #define MLO_POOLING_OP_MAX 1
 #define MLO_POOLING_OP_STC 2
 
-class mlo_construct_pooling2D : public mlo_construct_direct2D
+struct mlo_construct_pooling2D : mlo_construct_direct2D, mlo_construct_activ_lrn_pooling_common
 {
-    public:
     mlo_construct_pooling2D(int dir) : mlo_construct_direct2D(dir)
     {
         _pooling_method = MLO_POOLING_OP_MAX;
@@ -910,7 +936,7 @@ class mlo_construct_pooling2D : public mlo_construct_direct2D
     }
 
     inline int getPoolingMethod() const { return (_pooling_method); }
-    int mloConstruct() override;
+    int mloConstruct();
 
     protected:
     int _pooling_method;
@@ -922,9 +948,8 @@ class mlo_construct_pooling2D : public mlo_construct_direct2D
 #define MLO_LRN_WITHIN_CHANNEL 0
 #define MLO_LRN_ACROSS_CHANNELS 1
 
-class mlo_construct_norm : public mlo_construct_direct2D
+struct mlo_construct_norm : mlo_construct_direct2D, mlo_construct_activ_lrn_pooling_common
 {
-    public:
     mlo_construct_norm(int dir) : mlo_construct_direct2D(dir) {}
 
     inline void setNormDescr(
@@ -954,7 +979,7 @@ class mlo_construct_norm : public mlo_construct_direct2D
                             : _normAlpha / (_norm_area * _norm_area);
     }
 
-    int mloConstruct() override;
+    void mloConstruct();
 
     protected:
     int mloConstructFwd();
@@ -966,56 +991,41 @@ class mlo_construct_norm : public mlo_construct_direct2D
     double _normK     = 0.0;
 };
 
-#define MLO_NEURON_PASTHRU 0                       // x
-#define MLO_NEURON_LOGISTIC MLO_NEURON_PASTHRU + 1 //	1 / (1 + e^-x)	//Sigmoid
-#define MLO_NEURON_TANH MLO_NEURON_LOGISTIC + 1    //	a * tanh( b * x)
-#define MLO_NEURON_RELU MLO_NEURON_TANH + 1        //	max(0, x)
-#define MLO_NEURON_BRELU MLO_NEURON_RELU + 1       //	min(a, max(0, x))
-#define MLO_NEURON_SOFTRELU \
-    MLO_NEURON_BRELU + 1                       //	log(1 + e^x)   // bonomial normal log likelihood
-#define MLO_NEURON_ABS MLO_NEURON_SOFTRELU + 1 //	abs(x)
-#define MLO_NEURON_SQUARE MLO_NEURON_ABS + 1   //	x^2
-#define MLO_NEURON_SQR MLO_NEURON_SQUARE + 1   //	sqr(x)
-#define MLO_NEURON_LINEAR MLO_NEURON_SQR + 1   //	a + b * x
-#define MLO_NEURON_POWER MLO_NEURON_LINEAR + 1 // (a + b * x ) ^power
-#define MLO_NEURON_TOTAL MLO_NEURON_POWER + 1
-
-class mlo_construct_neuron : public mlo_construct_direct2D
+struct mlo_construct_neuron : mlo_construct_direct2D, mlo_construct_activ_lrn_pooling_common
 {
-    public:
     mlo_construct_neuron(int dir) : mlo_construct_direct2D(dir)
     {
         _neuron_type = 0;
-        _power       = 0;
-        _scale       = 1;
-        _shift       = 0;
+        _gamma       = 0;
+        _beta        = 1;
+        _alpha       = 0;
     }
 
-    inline void setNeuronDescr(int neuron_type, double power, double scale, double shift)
+    inline void setNeuronDescr(int neuron_type, double gamma, double beta, double alpha)
     {
         _neuron_type = neuron_type;
-        _power       = power;
-        _scale       = scale;
-        _shift       = shift;
+        _gamma       = gamma;
+        _beta        = beta;
+        _alpha       = alpha;
     }
 
-    inline void getNeuronDescr(int& neuron_type, double& power, double& scale, double& shift) const
+    inline void getNeuronDescr(int& neuron_type, double& gamma, double& beta, double& alpha) const
     {
         neuron_type = _neuron_type;
-        power       = _power;
-        scale       = _scale;
-        shift       = _shift;
+        gamma       = _gamma;
+        beta        = _beta;
+        alpha       = _alpha;
     }
 
-    int mloConstruct() override;
+    void mloConstruct();
 
     protected:
     int mloConstructFwd();
     int mloConstructBwd();
     int _neuron_type;
-    double _power;
-    double _scale;
-    double _shift;
+    double _gamma;
+    double _beta;
+    double _alpha;
 };
 
 #endif

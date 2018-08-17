@@ -39,12 +39,12 @@ struct ActivationDescriptor : miopenActivationDescriptor
 {
     ActivationDescriptor();
     ActivationDescriptor(miopenActivationMode_t m, const double* pparms);
-    ActivationDescriptor(miopenActivationMode_t m, double alpha, double beta, double power);
+    ActivationDescriptor(miopenActivationMode_t m, double alpha, double beta, double gamma);
 
     miopenActivationMode_t GetMode() const;
     double GetAlpha() const;
     double GetBeta() const;
-    double GetPower() const;
+    double GetGamma() const;
 
     miopenStatus_t Forward(Handle& handle,
                            const void* alpha,
@@ -52,7 +52,9 @@ struct ActivationDescriptor : miopenActivationDescriptor
                            ConstData_t x,
                            const void* beta,
                            const TensorDescriptor& yDesc,
-                           Data_t y);
+                           Data_t y,
+                           size_t xOffset = 0,
+                           size_t yOffset = 0);
 
     miopenStatus_t Backward(Handle& handle,
                             const void* alpha,
@@ -64,14 +66,18 @@ struct ActivationDescriptor : miopenActivationDescriptor
                             ConstData_t x,
                             const void* beta,
                             const TensorDescriptor& dxDesc,
-                            Data_t dx);
+                            Data_t dx,
+                            size_t yOffset  = 0,
+                            size_t dyOffset = 0,
+                            size_t xOffset  = 0,
+                            size_t dxOffset = 0);
 
     friend std::ostream& operator<<(std::ostream& stream, const ActivationDescriptor& x);
 
     private:
     std::vector<double> parms;
 
-    miopenActivationMode_t mode = miopenActivationPATHTRU;
+    miopenActivationMode_t mode = miopenActivationPASTHRU;
 };
 
 } // namespace miopen

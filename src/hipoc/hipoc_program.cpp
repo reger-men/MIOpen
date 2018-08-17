@@ -30,22 +30,13 @@
 #include <miopen/kernel_warnings.hpp>
 #include <miopen/stringutils.hpp>
 #include <miopen/tmp_dir.hpp>
+#include <miopen/write_file.hpp>
 #include <boost/optional.hpp>
 #include <sstream>
 
 #include <unistd.h>
 
 namespace miopen {
-
-using FilePtr = MIOPEN_MANAGE_PTR(FILE*, std::fclose);
-
-void WriteFile(const std::string& content, const boost::filesystem::path& name)
-{
-    // std::cerr << "Write file: " << name << std::endl;
-    FilePtr f{std::fopen(name.c_str(), "w")};
-    if(std::fwrite(content.c_str(), 1, content.size(), f.get()) != content.size())
-        MIOPEN_THROW("Failed to write to src file");
-}
 
 hipModulePtr CreateModule(const std::string& program_name, std::string params, bool is_kernel_str)
 {
@@ -81,9 +72,11 @@ hipModulePtr CreateModule(const std::string& program_name, std::string params, b
 
     hipModule_t raw_m;
     auto status = hipModuleLoad(&raw_m, hsaco_file.string().c_str());
-    hipModulePtr m{raw_m};
     if(status != hipSuccess)
         MIOPEN_THROW_HIP_STATUS(status, "Failed creating module");
+    // We construct the module after the error even though this might leak
+    // memory because it causes a nasty double free in glibc if we dont
+    hipModulePtr m{raw_m};
     return m;
 }
 

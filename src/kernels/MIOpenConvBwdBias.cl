@@ -23,11 +23,27 @@
  * SOFTWARE.
  *
  *******************************************************************************/
+#define PPCAT_NX(A, B) A##B
+#define PPCAT(A, B) PPCAT_NX(A, B)
+#define TWO 2
+#define FOUR 4
+#define EIGHT 8
+
+#if MIOPEN_USE_FP16 == 1
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#define _FLOAT half
+#endif
+#if MIOPEN_USE_FP32 == 1
 #define _FLOAT float
+#endif
+
+#define _FLOAT2 PPCAT(_FLOAT, TWO)
+#define _FLOAT4 PPCAT(_FLOAT, FOUR)
+#define _FLOAT8 PPCAT(_FLOAT, EIGHT)
 
 static inline int iDiv(int v, int d)
 {
-    int r = (int)((float)v / d + 0.00001f);
+    int r = v / d;
     return (r);
 }
 
@@ -37,9 +53,9 @@ static inline int iMod(int v, int u, int d)
     return (r);
 }
 
-static inline void ReduceKernel(__local _FLOAT* lcl_mem, int sum_stride, int unit_id, int unit_len)
+static inline void ReduceKernel(__local float* lcl_mem, int sum_stride, int unit_id, int unit_len)
 {
-    _FLOAT sum     = 0;
+    float sum      = 0.0f;
     int lcl_offset = unit_id * unit_len;
     for(int i = 0; i < unit_len; i += sum_stride)
     {
@@ -54,8 +70,8 @@ MIOpenConvBwdB(const __global _FLOAT* top_df, __global _FLOAT* bias_df)
     int lid        = (int)get_local_id(0);
     int output_map = get_group_id(1);
 
-    __local _FLOAT lcl_sum[MLO_CONVBWDB_LCL_MEMSZ];
-    _FLOAT sum = 0;
+    __local float lcl_sum[MLO_CONVBWDB_LCL_MEMSZ];
+    float sum = 0.0f;
 
     for(int j = lid; j < MLO_WK_SIZE * MLO_OUT_BATCH_SZ; j += MLO_CONVBWD_GROUP_SZ0)
     {
@@ -67,11 +83,16 @@ MIOpenConvBwdB(const __global _FLOAT* top_df, __global _FLOAT* bias_df)
         if(read_id == MLO_WK_SIZE - 1)
         {
             for(int k = 0; k < MLO_N_PIX_OFF; k++)
-                sum += top_df[glb_top_df_offset + k];
+                sum += (float)(top_df[glb_top_df_offset + k]);
+        }
+        else
+        {
+            for(int k = 0; k < MLO_CONVBWDB_UNITSIZE; k++)
+                sum += (float)(top_df[glb_top_df_offset + k]);
         }
 #else
         for(int k = 0; k < MLO_CONVBWDB_UNITSIZE; k++)
-            sum += top_df[glb_top_df_offset + k];
+            sum += (float)(top_df[glb_top_df_offset + k]);
 #endif
     }
     lcl_sum[lid] = sum;
@@ -97,5 +118,5 @@ MIOpenConvBwdB(const __global _FLOAT* top_df, __global _FLOAT* bias_df)
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    bias_df[output_map] = lcl_sum[0];
+    bias_df[output_map] = (_FLOAT)(lcl_sum[0]);
 }

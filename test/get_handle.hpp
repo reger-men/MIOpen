@@ -28,6 +28,7 @@
 #define GUARD_GET_HANDLE_HPP
 
 #include <miopen/handle.hpp>
+#include <thread>
 
 #ifndef MIOPEN_TEST_USE_GLOBAL_HANDLE
 #define MIOPEN_TEST_USE_GLOBAL_HANDLE 1
@@ -35,15 +36,21 @@
 
 #if MIOPEN_TEST_USE_GLOBAL_HANDLE
 
-static miopen::Handle& get_handle()
+static inline miopen::Handle& get_handle()
 {
     static miopen::Handle h{};
+    static std::thread::id id = std::this_thread::get_id();
+    if(std::this_thread::get_id() != id)
+    {
+        std::cout << "Cannot use handle across multiple threads\n";
+        std::abort();
+    }
     return h;
 }
 
 #else
 
-static miopen::Handle get_handle() { return miopen::Handle{}; }
+static inline miopen::Handle get_handle() { return miopen::Handle{}; }
 
 #endif
 

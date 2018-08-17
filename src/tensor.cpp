@@ -33,15 +33,11 @@
 
 namespace miopen {
 
-TensorDescriptor::TensorDescriptor() {}
+TensorDescriptor::TensorDescriptor() : packed(true) {}
 
 TensorDescriptor::TensorDescriptor(miopenDataType_t t, std::initializer_list<std::size_t> plens)
-    : lens(plens), type(t)
+    : lens(plens), packed(true), type(t)
 {
-    if(t != miopenFloat)
-    {
-        MIOPEN_THROW(miopenStatusNotImplemented, "Only float datatype is supported");
-    }
     this->CalculateStrides();
 }
 
@@ -50,19 +46,14 @@ TensorDescriptor::TensorDescriptor(miopenDataType_t t,
                                    std::initializer_list<std::size_t> pstrides)
     : lens(plens), strides(pstrides), type(t)
 {
-    if(t != miopenFloat)
-    {
-        MIOPEN_THROW(miopenStatusNotImplemented, "Only float datatype is supported");
-    }
+    packed = (this->GetElementSize() == this->GetElementSpace());
 }
 
 TensorDescriptor::TensorDescriptor(miopenDataType_t t, const int* plens, int size)
-    : lens(plens, plens + size), type(t)
+    : lens(plens, plens + size), packed(true), type(t)
 {
-    if(t != miopenFloat)
-    {
-        MIOPEN_THROW(miopenStatusNotImplemented, "Only float datatype is supported");
-    }
+    if(!std::all_of(plens, plens + size, [](int x) { return x >= 0; }))
+        MIOPEN_THROW("Invalid length. Length must be greater than 0.");
     this->CalculateStrides();
 }
 TensorDescriptor::TensorDescriptor(miopenDataType_t t,
@@ -71,18 +62,30 @@ TensorDescriptor::TensorDescriptor(miopenDataType_t t,
                                    int size)
     : lens(plens, plens + size), strides(pstrides, pstrides + size), type(t)
 {
-    if(t != miopenFloat)
-    {
-        MIOPEN_THROW(miopenStatusNotImplemented, "Only float datatype is supported");
-    }
+    if(!std::all_of(plens, plens + size, [](int x) { return x >= 0; }))
+        MIOPEN_THROW("Invalid length. Length must be greater than 0.");
+    if(!std::all_of(pstrides, pstrides + size, [](int x) { return x >= 0; }))
+        MIOPEN_THROW("Invalid strides. Strides must be greater than 0.");
+    packed = (this->GetElementSize() == this->GetElementSpace());
+}
+
+TensorDescriptor::TensorDescriptor(miopenDataType_t t,
+                                   std::vector<std::size_t> lens_in,
+                                   std::vector<std::size_t> strides_in)
+    : lens(std::move(lens_in)), strides(std::move(strides_in)), type(t)
+{
+    packed = (this->GetElementSize() == this->GetElementSpace());
 }
 
 void TensorDescriptor::CalculateStrides()
 {
     strides.clear();
     strides.resize(lens.size(), 0);
+    if(strides.empty())
+        return;
     strides.back() = 1;
-    std::partial_sum(lens.rbegin(), lens.rend() - 1, strides.rbegin() + 1, std::multiplies<int>());
+    std::partial_sum(
+        lens.rbegin(), lens.rend() - 1, strides.rbegin() + 1, std::multiplies<std::size_t>());
 }
 
 const std::vector<std::size_t>& TensorDescriptor::GetLengths() const { return lens; }
@@ -106,6 +109,32 @@ std::size_t TensorDescriptor::GetIndex(std::initializer_list<int> l) const
     return std::inner_product(l.begin(), l.end(), strides.begin(), std::size_t{0});
 }
 
+std::size_t TensorDescriptor::GetElementSpace() const
+{
+    std::vector<std::size_t> maxIndices(lens.size());
+    std::transform(lens.begin(),
+                   lens.end(),
+                   std::vector<std::size_t>(lens.size(), 1).begin(),
+                   maxIndices.begin(),
+                   std::minus<std::size_t>());
+    return std::inner_product(
+               maxIndices.begin(), maxIndices.end(), strides.begin(), std::size_t{0}) +
+           1;
+}
+
+std::size_t TensorDescriptor::GetNumBytes() const
+{
+    std::size_t typesize = 0;
+    switch(this->type)
+    {
+    case miopenHalf: typesize  = 2; break;
+    case miopenFloat: typesize = 4; break;
+    }
+    return typesize * this->GetElementSpace();
+}
+
+bool TensorDescriptor::IsPacked() const { return this->packed; }
+
 bool TensorDescriptor::operator==(const TensorDescriptor& rhs) const
 {
     assert(this->lens.size() == rhs.strides.size());
@@ -114,9 +143,23 @@ bool TensorDescriptor::operator==(const TensorDescriptor& rhs) const
 
 bool TensorDescriptor::operator!=(const TensorDescriptor& rhs) const { return !(*this == rhs); }
 
+bool TensorDescriptor::operator<(const TensorDescriptor& rhs) const
+{
+    return (std::tie(this->GetLengths(), this->GetStrides()) <
+            std::tie(rhs.GetLengths(), rhs.GetStrides()));
+}
+
+bool TensorDescriptor::operator>(const TensorDescriptor& rhs) const
+{
+    return (std::tie(this->GetLengths(), this->GetStrides()) >
+            std::tie(rhs.GetLengths(), rhs.GetStrides()));
+}
+
 std::string TensorDescriptor::ToString() const
 {
     std::string result;
+    if(this->lens.empty())
+        return result;
     for(auto i : this->lens)
     {
         result += std::to_string(i) + ", ";

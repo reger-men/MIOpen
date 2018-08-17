@@ -25,19 +25,40 @@
  *******************************************************************************/
 
 #include "miopen/solver.hpp"
+#include <miopen/env.hpp>
+
+MIOPEN_DECLARE_ENV_VAR(MIOPEN_WORKAROUND_ISSUE_1007)
 
 namespace miopen {
 namespace solver {
 
 bool ConvOclBwdWrW53::IsApplicable(const ConvolutionContext& params) const
 {
-    return (params.kernel_size0 >= 2) || (params.kernel_size1 >= 2);
+    // Cases when dy has negative padding are not supported (issue 918)
+    if(params.GetBackwardPad0() < 0 || params.GetBackwardPad1() < 0)
+        return false;
+    /// \todo Workaround for issue 1007, seems related to the next ones.
+    if(!miopen::IsDisabled(MIOPEN_WORKAROUND_ISSUE_1007{}) && params.kernel_size0 == 3 &&
+       (static_cast<double>(params.batch_sz) * params.out_height * params.out_width *
+        params.n_outputs * params.n_inputs) > 700000000)
+        return false;
+    /// \todo Workaround for some issues. Excludes some configs which covered by
+    /// the ConvOclBwdWrW2 solver. Found experimentally. Technically, this is a hack.
+    /// The kernel needs to be well understood and fixed.
+    if((params.kernel_size0 > 5) || (params.kernel_size0 == 5 && params.in_width >= 64))
+        return false;
+    /// \todo Workaround for issue #791. Found experimentally. Technically, this is a hack.
+    /// The kernel needs to be well understood and fixed.
+    if((params.kernel_size0 == 3 && params.pad0 == 0 && params.out_width >= 32))
+        return false;
+    return ((params.kernel_size0 >= 2 || params.kernel_size1 >= 2) &&
+            (params.kernel_stride1 == 1 && params.kernel_stride0 == 1));
 }
 
-ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params,
-                                          const PerformanceConfig&) const
+ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params) const
 {
     ConvSolution result;
+
     size_t localMemSize = 64 * 1024;
 
     const auto hw_wave_sz       = 64;
@@ -47,9 +68,6 @@ ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params,
     // inpout are outputs
     int wei_cstride = params.kernel_size0 * params.kernel_size1;
     int wei_bstride = params.n_outputs * wei_cstride;
-
-    int read_unit         = 4;
-    std::string READ_TYPE = (read_unit == 1) ? "_FLOAT" : "_FLOAT" + std::to_string((read_unit));
 
     // number  of batch iterations
     result.n_stacks = 1;
@@ -64,11 +82,6 @@ ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params,
                                   : 4;
     int n_batch_blks =
         (params.batch_sz + N_BATCH_LOOPS * result.n_stacks - 1) / (N_BATCH_LOOPS * result.n_stacks);
-    if(params.n_passes)
-    {
-        result.passes = (n_batch_blks > 1) ? 2 : 1;
-        return result;
-    }
 
     result.out_pix_tile0 = params.kernel_size0;
     result.out_pix_tile1 = params.kernel_size1;
@@ -76,9 +89,9 @@ ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params,
 
     // span size
     // param
-    result.in_tile0 = ((result.out_pix_tile0 * result.out_pix_tile1) <= 16 && (params.in_width > 8))
-                          ? 4
-                          : ((params.in_width / 3) * 3 == params.in_width) ? 3 : 2;
+    result.in_tile0 = (params.in_width % 4 == 0) ? 4 : (params.in_width % 3 == 0)
+                                                           ? 3
+                                                           : (params.in_width % 2 == 0) ? 2 : 1;
     int n_spans = (params.in_width + result.in_tile0 - 1) / result.in_tile0;
 
     // n of wavefronts per group
@@ -96,6 +109,14 @@ ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params,
         (params.in_width <= 32 && (result.out_pix_tile0 * result.out_pix_tile1) <= 16) ? 4 : 1;
 
     result.n_in_data_tiles = std::min(result.n_in_data_tiles, params.n_outputs);
+
+    static const int read_unit =
+        (params.out_width % 4 == 0) ? 4 : (params.out_width % 3 == 0)
+                                              ? 3
+                                              : (params.out_width % 2 == 0) ? 2 : 1;
+
+    static const std::string READ_TYPE =
+        (read_unit == 1) ? "_FLOAT" : "_FLOAT" + std::to_string((read_unit));
     // calculate number of input scans in the input block
     // max LDS size is 8K
     int in_lcl_width =
@@ -107,7 +128,7 @@ ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params,
                               ? (params.out_height + 1) / 2
                               : params.out_height;
     while(in_lcl_width * in_n_vert_reads * result.n_in_data_tiles >
-          (dev_local_mem_sz / (2 * sizeof(float))))
+          (dev_local_mem_sz / (2 * ((params.in_data_type == "FP32") ? 4 : 2))))
     {
         in_n_vert_reads = (in_n_vert_reads + 1) / 2;
         if(in_n_vert_reads < 2 && result.n_in_data_tiles >= 2)
@@ -117,8 +138,8 @@ ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params,
         }
         else if(in_n_vert_reads < 2)
         {
-            printf("CONFIG ERROR: not enough local memory for the configuration\n");
-            return ConvSolution(static_cast<miopenStatus_t>(-1));
+            MIOPEN_LOG_E("Not enough local memory to run direct algorithm");
+            return ConvSolution(miopenStatusUnknownError);
         }
     }
     int in_n_vert_read_loops = (params.in_height + in_n_vert_reads - 1) / in_n_vert_reads;
@@ -142,39 +163,41 @@ ConvSolution ConvOclBwdWrW53::GetSolution(const ConvolutionContext& params,
     std::string UT_READ_TYPE =
         (ut_read_unit == 1) ? "_FLOAT" : "_FLOAT" + std::to_string((ut_read_unit));
 
+    if(!params.direction.IsBackwardWrW())
+        MIOPEN_THROW("!params.direction.IsBackwardWrW()");
     // it's backward - inputs are outputs and vs versa
     const auto comp_options =
-        std::string(" -DMLO_DIR_FORWARD=") + std::to_string(params.forward) +
-        std::string(" -DMLO_GRP_SZ=") + std::to_string(GRP_SZ) + std::string(" -DMLO_GRP_SZ0=") +
-        std::to_string(result.grp_tile0) + std::string(" -DMLO_GRP_SZ1=") +
-        std::to_string(result.grp_tile1) + std::string(" -DMLO_GRP_SZ2=") +
-        std::to_string(grp_tile2) + std::string(" -DMLO_FILTER_SIZE0=") +
-        std::to_string(params.kernel_size0) + std::string(" -DMLO_FILTER_SIZE1=") +
-        std::to_string(params.kernel_size1) + std::string(" -DMLO_FILTER_PAD0=") +
-        std::to_string(params.pad0) + std::string(" -DMLO_FILTER_PAD1=") +
-        std::to_string(params.pad1) + std::string(" -DMLO_FILTER_STRIDE0=") +
-        std::to_string(params.kernel_stride0) + std::string(" -DMLO_FILTER_STRIDE1=") +
-        std::to_string(params.kernel_stride1) + std::string(" -DSTRIDE_W=") +
-        std::to_string(params.kernel_stride0) + std::string(" -DSTRIDE_H=") +
-        std::to_string(params.kernel_stride1) + std::string(" -DMLO_N_OUTPUTS=") +
-        std::to_string(params.n_inputs) + std::string(" -DMLO_N_INPUTS=") +
-        std::to_string(params.n_outputs) + std::string(" -DMLO_BATCH_SZ=") +
-        std::to_string(params.batch_sz) + std::string(" -DMLO_N_BATCH_LOOPS=") +
-        std::to_string(N_BATCH_LOOPS) + std::string(" -DMLO_OUT_BATCH_STRIDE=") +
-        std::to_string(params.in_batch_stride) + std::string(" -DMLO_OUT_CHANNEL_STRIDE=") +
-        std::to_string(params.in_channel_stride) + std::string(" -DMLO_OUT_STRIDE=") +
-        std::to_string(params.in_stride) + std::string(" -DMLO_IN_BATCH_STRIDE=") +
-        std::to_string(params.out_batch_stride) + std::string(" -DMLO_IN_CHANNEL_STRIDE=") +
-        std::to_string(params.out_channel_stride) + std::string(" -DMLO_IN_STRIDE=") +
-        std::to_string(params.out_stride) + std::string(" -DMLO_WEI_BATCH_STRIDE=") +
-        std::to_string(wei_bstride) + std::string(" -DMLO_WEI_CHANNEL_STRIDE=") +
-        std::to_string(wei_cstride) + std::string(" -DMLO_IN_WIDTH=") +
-        std::to_string(params.out_width) + std::string(" -DMLO_IN_HEIGHT=") +
-        std::to_string(params.out_height) + std::string(" -DMLO_OUT_WIDTH=") +
-        std::to_string(params.in_width) + std::string(" -DMLO_OUT_HEIGHT=") +
-        std::to_string(params.in_height) + std::string(" -DMLO_IN_TILE1=") +
-        std::to_string(result.in_tile1) + std::string(" -DMLO_IN_TILE0=") +
-        std::to_string(result.in_tile0) + std::string(" -DMLO_N_LCL_BATCHS=") +
+        std::string(" -DMLO_DIR_FORWARD=0") + std::string(" -DMLO_GRP_SZ=") +
+        std::to_string(GRP_SZ) + std::string(" -DMLO_GRP_SZ0=") + std::to_string(result.grp_tile0) +
+        std::string(" -DMLO_GRP_SZ1=") + std::to_string(result.grp_tile1) +
+        std::string(" -DMLO_GRP_SZ2=") + std::to_string(grp_tile2) +
+        std::string(" -DMLO_FILTER_SIZE0=") + std::to_string(params.kernel_size0) +
+        std::string(" -DMLO_FILTER_SIZE1=") + std::to_string(params.kernel_size1) +
+        std::string(" -DMLO_FILTER_PAD0=") + std::to_string(params.pad0) +
+        std::string(" -DMLO_FILTER_PAD1=") + std::to_string(params.pad1) +
+        std::string(" -DMLO_FILTER_STRIDE0=") + std::to_string(params.kernel_stride0) +
+        std::string(" -DMLO_FILTER_STRIDE1=") + std::to_string(params.kernel_stride1) +
+        std::string(" -DSTRIDE_W=") + std::to_string(params.kernel_stride0) +
+        std::string(" -DSTRIDE_H=") + std::to_string(params.kernel_stride1) +
+        std::string(" -DMLO_N_OUTPUTS=") + std::to_string(params.n_inputs) +
+        std::string(" -DMLO_N_INPUTS=") + std::to_string(params.n_outputs) +
+        std::string(" -DMLO_BATCH_SZ=") + std::to_string(params.batch_sz) +
+        std::string(" -DMLO_N_BATCH_LOOPS=") + std::to_string(N_BATCH_LOOPS) +
+        std::string(" -DMLO_OUT_BATCH_STRIDE=") + std::to_string(params.in_batch_stride) +
+        std::string(" -DMLO_OUT_CHANNEL_STRIDE=") + std::to_string(params.in_channel_stride) +
+        std::string(" -DMLO_OUT_STRIDE=") + std::to_string(params.in_stride) +
+        std::string(" -DMLO_IN_BATCH_STRIDE=") + std::to_string(params.out_batch_stride) +
+        std::string(" -DMLO_IN_CHANNEL_STRIDE=") + std::to_string(params.out_channel_stride) +
+        std::string(" -DMLO_IN_STRIDE=") + std::to_string(params.out_stride) +
+        std::string(" -DMLO_WEI_BATCH_STRIDE=") + std::to_string(wei_bstride) +
+        std::string(" -DMLO_WEI_CHANNEL_STRIDE=") + std::to_string(wei_cstride) +
+        std::string(" -DMLO_IN_WIDTH=") + std::to_string(params.out_width) +
+        std::string(" -DMLO_IN_HEIGHT=") + std::to_string(params.out_height) +
+        std::string(" -DMLO_OUT_WIDTH=") + std::to_string(params.in_width) +
+        std::string(" -DMLO_OUT_HEIGHT=") + std::to_string(params.in_height) +
+        std::string(" -DMLO_IN_TILE1=") + std::to_string(result.in_tile1) +
+        std::string(" -DMLO_IN_TILE0=") + std::to_string(result.in_tile0) +
+        std::string(" -DMLO_N_LCL_BATCHS=") +
         std::to_string(result.n_stacks) // # of diff stacks (part of batch).
         + std::string(" -DMLO_N_LCL_OUT_MAPS=") +
         std::to_string(result.n_out_pix_tiles) // # output pixel tiles per wk-item (ALU)

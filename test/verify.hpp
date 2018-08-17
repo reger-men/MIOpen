@@ -49,25 +49,36 @@ static constexpr sum_fn sum{};
 
 struct max_fn
 {
+    template <class T>
+    static T id(T x)
+    {
+        return x;
+    }
+
     template <class T, class U>
-    auto operator()(T x, U y) const MIOPEN_RETURNS(x > y ? x : y);
+    auto operator()(T x, U y) const MIOPEN_RETURNS(max_fn::id(x > y ? x : y));
 };
 static constexpr max_fn max{};
 
-struct abs_diff_fn
+namespace abs_diff_detail {
+using std::fabs;
+struct fn
 {
     template <class T, class U>
-    auto operator()(T x, U y) const MIOPEN_RETURNS(std::fabs(x - y));
+    auto operator()(T x, U y) const MIOPEN_RETURNS(fabs(x - y));
 };
 
-static constexpr abs_diff_fn abs_diff{};
+} // namespace abs_diff_detail
+
+static constexpr abs_diff_detail::fn abs_diff{};
 
 struct not_finite_fn
 {
     template <class T>
     bool operator()(T x) const
     {
-        return not std::isfinite(x);
+        using std::isfinite;
+        return not isfinite(x);
     }
 };
 static constexpr not_finite_fn not_finite{};
@@ -83,7 +94,8 @@ struct compare_mag_fn
     template <class T, class U>
     bool operator()(T x, U y) const
     {
-        return std::fabs(x) < std::fabs(y);
+        using std::fabs;
+        return fabs(x) < fabs(y);
     }
 };
 static constexpr compare_mag_fn compare_mag{};
@@ -168,6 +180,5 @@ double rms_range(R1&& r1, R2&& r2)
     else
         return std::numeric_limits<range_value<R1>>::max();
 }
-}
-
+} // namespace miopen
 #endif

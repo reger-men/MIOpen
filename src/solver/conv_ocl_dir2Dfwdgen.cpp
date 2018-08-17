@@ -32,13 +32,14 @@ namespace solver {
 
 bool ConvOclDirectFwdGen::IsApplicable(const ConvolutionContext& params) const
 {
-    return params.forward && (params.kernel_size0 > 11 || params.kernel_size1 > 11 ||
-                              ((params.kernel_stride0 > 1 || params.kernel_stride1 > 1) &&
-                               !(params.kernel_size0 == 1 && params.kernel_size1 == 1)));
+    return params.direction.IsForward() && params.kernel_stride0 == params.kernel_stride1 &&
+           params.pad0 == params.pad1 &&
+           (params.kernel_size0 > 11 || params.kernel_size1 > 11 ||
+            ((params.kernel_stride0 > 1 || params.kernel_stride1 > 1) &&
+             !(params.kernel_size0 == 1 && params.kernel_size1 == 1)));
 }
 
-ConvSolution ConvOclDirectFwdGen::GetSolution(const ConvolutionContext& params,
-                                              const PerformanceConfig&) const
+ConvSolution ConvOclDirectFwdGen::GetSolution(const ConvolutionContext& params) const
 {
     int n_in_stacks = 0;
     if(params.kernel_size1 == 3 && params.kernel_size0 == 3)
@@ -143,7 +144,7 @@ ConvSolution ConvOclDirectFwdGen::GetSolution(const ConvolutionContext& params,
 
     construction_params.comp_options =
         std::string("-DMLO_GRP_SZ=") +
-        std::to_string(static_cast<long long>(ocl_group_sz0 * ocl_group_sz1 * ocl_group_sz2)) +
+        std::to_string(static_cast<long long>(ocl_group_sz0) * ocl_group_sz1 * ocl_group_sz2) +
         std::string(" -DMLO_GRP_SZ0=") + std::to_string(static_cast<long long>(ocl_group_sz0)) +
         std::string(" -DMLO_GRP_SZ1=") + std::to_string(static_cast<long long>(ocl_group_sz1)) +
         std::string(" -DMLO_GRP_SZ2=") + std::to_string(static_cast<long long>(ocl_group_sz2)) +
@@ -194,11 +195,11 @@ ConvSolution ConvOclDirectFwdGen::GetSolution(const ConvolutionContext& params,
         std::to_string(
             static_cast<long long>(n_in_pix_vert)) // size of output processing group in 1 dim
         + std::string(" -DMLO_WEI_SZ=") +
-        std::to_string(static_cast<long long>(params.n_outputs * params.n_inputs *
-                                              params.kernel_size0 * params.kernel_size1)) +
+        std::to_string(static_cast<long long>(params.n_outputs) * params.n_inputs *
+                       params.kernel_size0 * params.kernel_size1) +
         std::string(" -DMLO_WEIGHTS_STRIDE=") +
-        std::to_string(static_cast<long long>(params.n_inputs * params.kernel_size0 *
-                                              params.kernel_size1)) //	weights stride
+        std::to_string(static_cast<long long>(params.n_inputs) * params.kernel_size0 *
+                       params.kernel_size1) //	weights stride
         + std::string(" -DMLO_N_STACKS=") +
         std::to_string(static_cast<long long>(n_stack_blocks)) // n of separate data stacks
         + std::string(" -DMLO_N_PROCS0=") +

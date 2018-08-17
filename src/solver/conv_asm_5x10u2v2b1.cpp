@@ -33,7 +33,12 @@ namespace solver {
 
 bool ConvAsm5x10u2v2b1::IsApplicable(const ConvolutionContext& params) const
 {
-    if(!params.assembler_available)
+    if(!params.use_asm_kernels)
+    {
+        return false;
+    }
+    if(!(params.rmv == rocm_meta_version::V1 || params.rmv == rocm_meta_version::V3 ||
+         params.rmv == rocm_meta_version::AMDHSA_1_0))
     {
         return false;
     }
@@ -41,16 +46,16 @@ bool ConvAsm5x10u2v2b1::IsApplicable(const ConvolutionContext& params) const
     const std::string name = params.GetStream().GetDeviceName();
     const bool device_is_gfx8_9_no_xnack =
         (name == "gfx800" || name == "gfx802" || name == "gfx803" || name == "gfx804" ||
-         name == "gfx900");
+         name == "gfx900" || name == "gfx904" || name == "gfx906");
     if(!device_is_gfx8_9_no_xnack)
     {
         return false;
     }
-    if(params.forward)
+    if(!params.direction.IsBackwardData())
     {
         return false;
     }
-    assert(params.weights_layout.length() == 0); // FIXME _weights_layout is not supported yet.
+    assert(params.weights_layout.length() == 0); // _weights_layout is not supported yet.
 
     // Min image + padding shall be not smaller than filter matrix.
     const int min_out_width  = 138;
@@ -59,25 +64,26 @@ bool ConvAsm5x10u2v2b1::IsApplicable(const ConvolutionContext& params) const
     const int max_out_width  = 8192 - 1;
     const int max_out_height = 131077 - 1;
 
-    return                                   // Opt. Param   Restrictions in source
-        params.pad0 == 0                     // -q   pad_w   fixed
-        && params.pad1 == 0                  // -p   pad_h   fixed
-        && params.kernel_stride0 == 2        // -u   inp_u   fixed
-        && params.kernel_stride1 == 2        // -v   inp_v   fixed
-        && params.kernel_size0 == 10         // -x   wei_w   fixed
-        && params.kernel_size1 == 5          // -y   wei_h   fixed
-        && params.n_outputs % 16 == 0        // -c   wei_c   no upper limit
-        && params.n_inputs >= 16             // -k   wei_k   no upper limit
-        && params.out_width >= min_out_width // -W   inp_w
-        && params.out_width <= max_out_width && params.out_height >= min_out_height // -H   inp_h
-        && params.out_height <= max_out_height &&
-        params.out_layout == "NCHW"; //              hardcoded
-    // && (isForwardDirection() ? _weights_layout == "KCHW" : _weights_layout == "CKHW" ) // See
-    // fixme above.
+    // clang-format off
+    return params.pad0 == 0                     // -q   pad_w   fixed
+        && params.pad1 == 0                     // -p   pad_h   fixed
+        && params.kernel_stride0 == 2           // -u   inp_u   fixed
+        && params.kernel_stride1 == 2           // -v   inp_v   fixed
+        && params.kernel_size0 == 10            // -x   wei_w   fixed
+        && params.kernel_size1 == 5             // -y   wei_h   fixed
+        && params.n_outputs % 16 == 0           // -c   wei_c   no upper limit
+        && params.n_inputs >= 16                // -k   wei_k   no upper limit
+        && params.out_width >= min_out_width    // -W   inp_w
+        && params.out_width <= max_out_width
+        && params.out_height >= min_out_height  // -H   inp_h
+        && params.out_height <= max_out_height
+        && params.float_size == 32
+        && params.out_layout == "NCHW";         // hardcoded
+        // && (isForwardDirection() ? _weights_layout == "KCHW" : _weights_layout == "CKHW" )
+    // clang-format on
 }
 
-ConvSolution ConvAsm5x10u2v2b1::GetSolution(const ConvolutionContext& params,
-                                            const PerformanceConfig&) const
+ConvSolution ConvAsm5x10u2v2b1::GetSolution(const ConvolutionContext& params) const
 {
     ConvSolution result;
     std::ostringstream options;
@@ -85,7 +91,10 @@ ConvSolution ConvAsm5x10u2v2b1::GetSolution(const ConvolutionContext& params,
     GenerateClangDefsym(options, "inp_w", params.out_width);
     GenerateClangDefsym(options, "wei_c", params.n_outputs);
     GenerateClangDefsym(options, "wei_k", params.n_inputs);
-    GenerateClangDefsym(options, "ROCM_METADATA_VERSION", (params.rmv == V1) ? 1 : 3);
+    GenerateClangDefsym(
+        options,
+        "ROCM_METADATA_VERSION",
+        (params.rmv == rocm_meta_version::V1) ? 1 : (params.rmv == rocm_meta_version::V3) ? 3 : 4);
 
     KernelInfo constr_params;
     constr_params.comp_options = options.str();

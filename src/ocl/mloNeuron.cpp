@@ -52,13 +52,11 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <miopen/mlo_internal.hpp>
 #include <miopen/mlo_utils.hpp>
 
-int mlo_construct_neuron::mloConstruct()
+void mlo_construct_neuron::mloConstruct()
 {
-    int ret     = 0;
     _hw_wave_sz = 64;
 
-    int read_unit         = 4;
-    std::string READ_TYPE = (read_unit == 1) ? "_FLOAT" : "_FLOAT" + std::to_string((read_unit));
+    const int read_unit = 4;
 
     size_t map_size = _search_params.in_width * _search_params.in_height * _search_params.n_inputs *
                       _search_params.batch_sz;
@@ -72,14 +70,16 @@ int mlo_construct_neuron::mloConstruct()
     _grp_tile1 = 1;
 
     _comp_options =
-        std::string(" -DMLO_NRN_GROUP_SZ0=") + std::to_string(static_cast<long long>(_grp_tile0)) +
-        std::string(" -DMLO_NRN_GROUP_SZ1=") + std::to_string(static_cast<long long>(_grp_tile1)) +
-        std::string(" -DMLO_NRN_OP_ID=") + std::to_string(static_cast<long long>(_neuron_type)) +
-        std::string(" -DMLO_N_PIXS_OFF=") + std::to_string(static_cast<long long>(N_PIXS_OFF)) +
-        std::string(" -DMLO_MAP_SZ=") + std::to_string(static_cast<long long>(map_size)) +
-        std::string(" -DMLO_MAP_SZ_ALIGNED=") +
+        std::string(" -DMIOPEN_NRN_GROUP_SZ0=") +
+        std::to_string(static_cast<long long>(_grp_tile0)) +
+        std::string(" -DMIOPEN_NRN_GROUP_SZ1=") +
+        std::to_string(static_cast<long long>(_grp_tile1)) + std::string(" -DMIOPEN_NRN_OP_ID=") +
+        std::to_string(static_cast<long long>(_neuron_type)) +
+        std::string(" -DMIOPEN_N_PIXS_OFF=") + std::to_string(static_cast<long long>(N_PIXS_OFF)) +
+        std::string(" -DMIOPEN_MAP_SZ=") + std::to_string(static_cast<long long>(map_size)) +
+        std::string(" -DMIOPEN_MAP_SZ_ALIGNED=") +
         std::to_string(static_cast<long long>(map_size_aligned)) +
-        std::string(" -DMLO_READ_UNIT=") + std::to_string(static_cast<long long>(read_unit)) +
+        std::string(" -DMIOPEN_READ_UNIT=") + std::to_string(static_cast<long long>(read_unit)) +
         getGeneralCompOptions();
 
     _l_wk.clear();
@@ -94,8 +94,6 @@ int mlo_construct_neuron::mloConstruct()
 
     _kernel_file = "MIOpenNeuron.cl";
     _kernel_name = (isForwardDirection()) ? "MIOpenNeuronFwd" : "MIOpenNeuronBwd";
-
-    return (ret);
 }
 
 int mlo_construct_neuron::mloConstructFwd()

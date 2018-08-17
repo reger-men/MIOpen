@@ -1,19 +1,19 @@
 ################################################################################
-# 
+#
 # MIT License
-# 
+#
 # Copyright (c) 2017 Advanced Micro Devices, Inc.
-# 
+#
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
 # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
-# 
+#
 # The above copyright notice and this permission notice shall be included in all
 # copies or substantial portions of the Software.
-# 
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -21,7 +21,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# 
+#
 ################################################################################
 cmake_minimum_required( VERSION 2.8.12 )
 
@@ -40,6 +40,8 @@ endif()
 
 project ( MIOpen C CXX )
 
+enable_testing()
+
 find_package(ROCM REQUIRED PATHS /opt/rocm)
 
 include(ROCMInstallTargets)
@@ -48,7 +50,14 @@ include(ROCMSetupVersion)
 include(ROCMInstallSymlinks)
 include(ROCMCreatePackage)
 
-rocm_setup_version(VERSION 1.1.4)
+
+# Strip symbols for release
+if(NOT WIN32 AND NOT APPLE)
+    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -s")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -s")
+endif()
+
+rocm_setup_version(VERSION 1.4.2)
 
 list( APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake )
 
@@ -59,8 +68,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 ############################################################
-# require C++11
-add_compile_options(-std=gnu++14)
+# require C++14
+add_compile_options(-std=c++14)
 
 ############################################################
 # OPTION - MIOpen Backend
@@ -96,6 +105,7 @@ endif()
 
 # HIP
 if( MIOPEN_BACKEND STREQUAL "HIP" OR MIOPEN_BACKEND STREQUAL "HIPOC")
+    list(APPEND CMAKE_PREFIX_PATH /opt/rocm /opt/rocm/hip /opt/rocm/hcc)
     set(MIOPEN_BACKEND_HIP 1)
     find_program(HIP_OC_COMPILER clang-ocl
         PATH_SUFFIXES bin
@@ -107,8 +117,7 @@ if( MIOPEN_BACKEND STREQUAL "HIP" OR MIOPEN_BACKEND STREQUAL "HIPOC")
     else()
         message(FATAL_ERROR "clang-ocl not found")
     endif()
-    
-    find_package(hip REQUIRED PATHS /opt/rocm)
+    find_package(hip REQUIRED)
     link_libraries(stdc++)
     # A hack to make this work without the device enumerator
     link_libraries(-amdgpu-target=gfx803 -amdgpu-target=gfx900 -Wno-unused-command-line-argument)
@@ -134,12 +143,12 @@ else()
     set(MIOPEN_USE_MIOPENGEMM 0)
 endif()
 
-find_package(OpenSSL)
+find_package(OpenSSL REQUIRED)
 set(BOOST_COMPONENTS filesystem system)
 add_definitions(-DBOOST_ALL_NO_LIB=1)
-find_package(Boost COMPONENTS ${BOOST_COMPONENTS})
+find_package(Boost REQUIRED COMPONENTS ${BOOST_COMPONENTS})
 
-set(MIOPEN_USE_CACHE On CACHE BOOL "")
+find_path(HALF_INCLUDE_DIR half.hpp)
 
 option( BUILD_SHARED_LIBS "Build as a shared library" ON )
 
@@ -148,18 +157,21 @@ option( BUILD_DEV "Build for development only" OFF)
 set( MIOPEN_INSTALL_DIR miopen)
 set( DATA_INSTALL_DIR ${MIOPEN_INSTALL_DIR}/${CMAKE_INSTALL_DATAROOTDIR}/miopen )
 
+set(MIOPEN_GPU_SYNC Off CACHE BOOL "")
 if(BUILD_DEV)
     set(MIOPEN_BUILD_DEV 1)
-    set(MIOPEN_DB_PATH "${CMAKE_SOURCE_DIR}/src/kernels")
+    set(MIOPEN_DB_PATH "${CMAKE_SOURCE_DIR}/src/kernels" CACHE PATH "Default path to search for installed db")
+    set(MIOPEN_USER_DB_PATH "${CMAKE_SOURCE_DIR}/src/kernels" CACHE PATH "Default path to search for user db")
     set(MIOPEN_CACHE_DIR "" CACHE STRING "")
 else()
     set(MIOPEN_BUILD_DEV 0)
-    set(MIOPEN_DB_PATH "${CMAKE_INSTALL_PREFIX}/${DATA_INSTALL_DIR}/db" CACHE PATH "Default path to search for db")
+    set(MIOPEN_DB_PATH "${CMAKE_INSTALL_PREFIX}/${DATA_INSTALL_DIR}/db" CACHE PATH "Default path to search for installed db")
+    set(MIOPEN_USER_DB_PATH "~/.config/miopen/" CACHE STRING "Default path to search for user db")
     set(MIOPEN_CACHE_DIR "~/.cache/miopen/" CACHE STRING "")
 endif()
 
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "openssl, rocm-opencl-dev, rocm-utils, hip_hcc, miopengemm")
-set(CPACK_RPM_PACKAGE_REQUIRES "openssl, rocm-opencl-dev, rocm-utils, hip_hcc, miopengemm")
+set(CPACK_RPM_PACKAGE_REQUIRES "openssl, rocm-opencl-devel, rocm-utils, hip_hcc, miopengemm")
 
 rocm_create_package(
     NAME MIOpen-${MIOPEN_BACKEND}
@@ -175,10 +187,10 @@ if(CMAKE_CXX_COMPILER MATCHES ".*hcc")
 endif()
 include(ClangTidy)
 enable_clang_tidy(
-    CHECKS 
+    CHECKS
         *
+        -cert-env33-c
         -android-cloexec-fopen
-        -cert-err60-cpp
         # Yea we shouldn't be using rand()
         -cert-msc30-c
         -cert-msc50-cpp
@@ -186,6 +198,7 @@ enable_clang_tidy(
         -clang-analyzer-optin.performance.Padding
         -clang-diagnostic-deprecated-declarations
         -clang-diagnostic-extern-c-compat
+        -clang-diagnostic-unused-command-line-argument
         -cppcoreguidelines-pro-bounds-array-to-pointer-decay
         -cppcoreguidelines-pro-bounds-constant-array-index
         -cppcoreguidelines-pro-bounds-pointer-arithmetic
@@ -194,6 +207,7 @@ enable_clang_tidy(
         -cppcoreguidelines-pro-type-union-access
         -cppcoreguidelines-pro-type-vararg
         -cppcoreguidelines-special-member-functions
+        -fuchsia-*
         -google-explicit-constructor
         -google-readability-braces-around-statements
         -google-readability-todo
@@ -201,6 +215,7 @@ enable_clang_tidy(
         -google-runtime-references
         -hicpp-braces-around-statements
         -hicpp-explicit-conversions
+        -hicpp-no-array-decay
         # We really shouldn't use bitwise operators with signed integers, but
         # opencl leaves us no choice
         -hicpp-signed-bitwise
@@ -209,32 +224,55 @@ enable_clang_tidy(
         -hicpp-use-override
         -llvm-header-guard
         -llvm-include-order
-        -misc-macro-parentheses
         -misc-misplaced-const
-        -misc-misplaced-widening-cast
-        -modernize-loop-convert
         -modernize-pass-by-value
         -modernize-use-default-member-init
-        -modernize-use-emplace
         -modernize-use-equals-default
         -modernize-use-transparent-functors
         -performance-unnecessary-value-param
         -readability-braces-around-statements
         -readability-else-after-return
-        -readability-implicit-bool-cast
-        -readability-implicit-bool-conversion
-        -readability-misleading-indentation
         -readability-named-parameter
         ${CLANG_TIDY_CHECKS}
     ERRORS
         *
         -readability-inconsistent-declaration-parameter-name
     HEADER_FILTER
-        "hpp$"
+        ".*hpp"
     EXTRA_ARGS
         -DMIOPEN_USE_CLANG_TIDY
     ANALYZE_TEMPORARY_DTORS ON
 
+)
+include(CppCheck)
+enable_cppcheck(
+    CHECKS 
+        all
+    SUPPRESS 
+        ConfigurationNotChecked
+        unmatchedSuppression
+        unusedFunction
+        # constStatement
+        noExplicitConstructor
+        passedByValue
+        # preprocessorErrorDirective
+        unusedStructMember
+        # Ignore initializer lists in the tests
+        useInitializationList:*test/*.cpp
+        *:*.cl
+    FORCE
+    SOURCES
+        addkernels/
+        # driver/
+        include/
+        src/
+        test/
+    INCLUDE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+    DEFINE
+        MIOPEN_USE_MIOPENGEMM=1
 )
 
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib)
